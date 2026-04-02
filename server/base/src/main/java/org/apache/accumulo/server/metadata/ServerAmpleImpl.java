@@ -1,0 +1,292 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.server.metadata;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.apache.accumulo.core.metadata.RootTable.ZROOT_TABLET_GC_CANDIDATES;
+import static org.apache.accumulo.server.util.MetadataTableUtil.EMPTY_TEXT;
+
+import java.net.URI;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+import org.apache.accumulo.core.client.BatchWriter;
+import org.apache.accumulo.core.client.MutationsRejectedException;
+import org.apache.accumulo.core.client.Scanner;
+import org.apache.accumulo.core.client.TableNotFoundException;
+import org.apache.accumulo.core.data.Mutation;
+import org.apache.accumulo.core.data.Range;
+import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.data.Value;
+import org.apache.accumulo.core.dataImpl.KeyExtent;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.gc.GcCandidate;
+import org.apache.accumulo.core.gc.ReferenceFile;
+import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.ScanServerRefStore;
+import org.apache.accumulo.core.metadata.StoredTabletFile;
+import org.apache.accumulo.core.metadata.SystemTables;
+import org.apache.accumulo.core.metadata.ValidationUtil;
+import org.apache.accumulo.core.metadata.schema.Ample;
+import org.apache.accumulo.core.metadata.schema.AmpleImpl;
+import org.apache.accumulo.core.metadata.schema.MetadataSchema.BlipSection;
+import org.apache.accumulo.core.metadata.schema.MetadataSchema.DeletesSection;
+import org.apache.accumulo.core.metadata.schema.MetadataSchema.DeletesSection.SkewedKeyValue;
+import org.apache.accumulo.core.security.Authorizations;
+import org.apache.accumulo.server.ServerContext;
+import org.apache.hadoop.io.Text;
+import org.apache.zookeeper.KeeperException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.google.common.annotations.VisibleForTesting;
+
+public class ServerAmpleImpl extends AmpleImpl implements Ample {
+
+  private static final Logger log = LoggerFactory.getLogger(ServerAmpleImpl.class);
+
+  private final ServerContext context;
+  private final ScanServerRefStore scanServerRefStore;
+
+  public ServerAmpleImpl(ServerContext context) {
+    this(context, DataLevel::metaTable);
+  }
+
+  public ServerAmpleImpl(ServerContext context, Function<DataLevel,String> tableMapper) {
+    super(context, tableMapper);
+    this.context = context;
+    this.scanServerRefStore =
+        new ScanServerRefStoreImpl(context, SystemTables.SCAN_REF.tableName());
+  }
+
+  @Override
+  public Ample.TabletMutator mutateTablet(KeyExtent extent) {
+    TabletsMutator tmi = mutateTablets();
+    Ample.TabletMutator tabletMutator = tmi.mutateTablet(extent);
+    ((TabletMutatorImpl) tabletMutator).setCloseAfterMutate(tmi);
+    return tabletMutator;
+  }
+
+  @Override
+  public TabletsMutator mutateTablets() {
+    return new TabletsMutatorImpl(context, getTableMapper());
+  }
+
+  @Override
+  public ConditionalTabletsMutator conditionallyMutateTablets() {
+    return new ConditionalTabletsMutatorImpl(context, getTableMapper(),
+        context.getSharedMetadataWriter(), context.getSharedUserWriter());
+  }
+
+  @Override
+  public AsyncConditionalTabletsMutator
+      conditionallyMutateTablets(Consumer<ConditionalResult> resultsConsumer) {
+    return new AsyncConditionalTabletsMutatorImpl(resultsConsumer,
+        () -> new ConditionalTabletsMutatorImpl(context, getTableMapper(),
+            context.getSharedMetadataWriter(), context.getSharedUserWriter()));
+  }
+
+  private void mutateRootGcCandidates(Consumer<RootGcCandidates> mutator) {
+    try {
+      // TODO calling create seems unnecessary and is possibly racy and inefficient
+      context.getZooSession().asReaderWriter().mutateOrCreate(ZROOT_TABLET_GC_CANDIDATES,
+          new byte[0], currVal -> {
+            String currJson = new String(currVal, UTF_8);
+            RootGcCandidates rgcc = new RootGcCandidates(currJson);
+            log.debug("Root GC candidates before change : {}", currJson);
+            mutator.accept(rgcc);
+            String newJson = rgcc.toJson();
+            log.debug("Root GC candidates after change  : {}", newJson);
+            if (newJson.length() > 262_144) {
+              log.warn(
+                  "Root tablet deletion candidates stored in ZK at {} are getting large ({} bytes), is"
+                      + " Accumulo GC process running?  Large nodes may cause problems for Zookeeper!",
+                  ZROOT_TABLET_GC_CANDIDATES, newJson.length());
+            }
+            return newJson.getBytes(UTF_8);
+          });
+    } catch (Exception e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void putGcCandidates(TableId tableId, Collection<StoredTabletFile> candidates) {
+
+    if (SystemTables.ROOT.tableId().equals(tableId)) {
+      mutateRootGcCandidates(rgcc -> rgcc.add(candidates.stream()));
+      return;
+    }
+
+    try (BatchWriter writer = context.createBatchWriter(getMetaTable(DataLevel.of(tableId)))) {
+      for (StoredTabletFile file : candidates) {
+        writer.addMutation(createDeleteMutation(file));
+      }
+    } catch (MutationsRejectedException | TableNotFoundException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void putGcFileAndDirCandidates(TableId tableId, Collection<ReferenceFile> candidates) {
+
+    if (DataLevel.of(tableId) == DataLevel.ROOT) {
+      // Directories are unexpected for the root tablet, so convert to stored tablet file
+      mutateRootGcCandidates(rgcc -> rgcc.add(candidates.stream()
+          .map(reference -> StoredTabletFile.of(URI.create(reference.getMetadataPath())))));
+      return;
+    }
+
+    try (BatchWriter writer = context.createBatchWriter(getMetaTable(DataLevel.of(tableId)))) {
+      for (var fileOrDir : candidates) {
+        writer.addMutation(createDeleteMutation(fileOrDir));
+      }
+    } catch (MutationsRejectedException | TableNotFoundException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void addBulkLoadInProgressFlag(String path, FateId fateId) {
+
+    // Bulk Import operations are not supported on the metadata table, so no entries will ever be
+    // required on the root table.
+    Mutation m = new Mutation(BlipSection.getRowPrefix() + path);
+    m.put(EMPTY_TEXT, EMPTY_TEXT, new Value(fateId.canonical()));
+
+    try (BatchWriter bw = context.createBatchWriter(SystemTables.METADATA.tableName())) {
+      bw.addMutation(m);
+    } catch (MutationsRejectedException | TableNotFoundException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void removeBulkLoadInProgressFlag(String path) {
+
+    // Bulk Import operations are not supported on the metadata table, so no entries will ever be
+    // required on the root table.
+    Mutation m = new Mutation(BlipSection.getRowPrefix() + path);
+    m.putDelete(EMPTY_TEXT, EMPTY_TEXT);
+
+    try (BatchWriter bw = context.createBatchWriter(SystemTables.METADATA.tableName())) {
+      bw.addMutation(m);
+    } catch (MutationsRejectedException | TableNotFoundException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void deleteGcCandidates(DataLevel level, Collection<GcCandidate> candidates,
+      GcCandidateType type) {
+
+    if (level == DataLevel.ROOT) {
+      if (type == GcCandidateType.INUSE) {
+        // Since there is only a single root tablet, supporting INUSE candidate deletions would add
+        // additional code complexity without any substantial benefit.
+        // Therefore, deletion of root INUSE candidates is not supported.
+        return;
+      }
+      mutateRootGcCandidates(rgcc -> rgcc.remove(candidates.stream()));
+      return;
+    }
+
+    try (BatchWriter writer = context.createBatchWriter(getMetaTable(level))) {
+      if (type == GcCandidateType.VALID) {
+        for (GcCandidate candidate : candidates) {
+          Mutation m = new Mutation(DeletesSection.encodeRow(candidate.getPath()));
+          // Removes all versions of the candidate to avoid reprocessing deleted file entries
+          m.putDelete(EMPTY_TEXT, EMPTY_TEXT);
+          writer.addMutation(m);
+        }
+      } else {
+        for (GcCandidate candidate : candidates) {
+          Mutation m = new Mutation(DeletesSection.encodeRow(candidate.getPath()));
+          // Removes this and older versions while allowing newer candidate versions to persist
+          m.putDelete(EMPTY_TEXT, EMPTY_TEXT, candidate.getUid());
+          writer.addMutation(m);
+        }
+      }
+    } catch (MutationsRejectedException | TableNotFoundException e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public Iterator<GcCandidate> getGcCandidates(DataLevel level) {
+    if (level == DataLevel.ROOT) {
+      var zooReader = context.getZooSession().asReader();
+      byte[] jsonBytes;
+      try {
+        jsonBytes = zooReader.getData(RootTable.ZROOT_TABLET_GC_CANDIDATES);
+      } catch (KeeperException | InterruptedException e) {
+        throw new IllegalStateException(e);
+      }
+      return new RootGcCandidates(new String(jsonBytes, UTF_8)).sortedStream().iterator();
+    } else if (level == DataLevel.METADATA || level == DataLevel.USER) {
+      Range range = DeletesSection.getRange();
+
+      Scanner scanner;
+      try {
+        scanner = context.createScanner(getMetaTable(level), Authorizations.EMPTY);
+      } catch (TableNotFoundException e) {
+        throw new IllegalStateException(e);
+      }
+      scanner.setRange(range);
+      return scanner.stream().filter(entry -> entry.getValue().equals(SkewedKeyValue.NAME))
+          .map(
+              entry -> new GcCandidate(DeletesSection.decodeRow(entry.getKey().getRow().toString()),
+                  entry.getKey().getTimestamp()))
+          .iterator();
+    } else {
+      throw new IllegalArgumentException();
+    }
+  }
+
+  @Override
+  public Mutation createDeleteMutation(ReferenceFile tabletFilePathToRemove) {
+    return createDelMutation(ValidationUtil.validate(tabletFilePathToRemove).getMetadataPath());
+  }
+
+  public Mutation createDeleteMutation(StoredTabletFile pathToRemove) {
+    return createDelMutation(pathToRemove.getMetadataPath());
+  }
+
+  private Mutation createDelMutation(String path) {
+    Mutation delFlag = new Mutation(new Text(DeletesSection.encodeRow(path)));
+    delFlag.put(EMPTY_TEXT, EMPTY_TEXT, DeletesSection.SkewedKeyValue.NAME);
+    return delFlag;
+  }
+
+  @Override
+  public ScanServerRefStore scanServerRefs() {
+    return scanServerRefStore;
+  }
+
+  @VisibleForTesting
+  protected ServerContext getContext() {
+    return context;
+  }
+
+  private String getMetaTable(DataLevel dataLevel) {
+    return getTableMapper().apply(dataLevel);
+  }
+}

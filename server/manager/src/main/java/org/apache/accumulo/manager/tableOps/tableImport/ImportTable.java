@@ -1,0 +1,175 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.manager.tableOps.tableImport;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.function.Predicate.not;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+import org.apache.accumulo.core.Constants;
+import org.apache.accumulo.core.client.AccumuloException;
+import org.apache.accumulo.core.clientImpl.AcceptableThriftTableOperationException;
+import org.apache.accumulo.core.clientImpl.TableOperationsImpl;
+import org.apache.accumulo.core.clientImpl.thrift.TableOperation;
+import org.apache.accumulo.core.clientImpl.thrift.TableOperationExceptionType;
+import org.apache.accumulo.core.data.NamespaceId;
+import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
+import org.apache.accumulo.manager.tableOps.AbstractFateOperation;
+import org.apache.accumulo.manager.tableOps.FateEnv;
+import org.apache.accumulo.manager.tableOps.Utils;
+import org.apache.accumulo.manager.tableOps.tableExport.ExportTable;
+import org.apache.accumulo.server.AccumuloDataVersion;
+import org.apache.accumulo.server.ServerContext;
+import org.apache.hadoop.fs.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
+/**
+ * Serialization updated for supporting multiple volumes in import table from 1L to 2L.
+ */
+public class ImportTable extends AbstractFateOperation {
+  private static final Logger log = LoggerFactory.getLogger(ImportTable.class);
+
+  private static final long serialVersionUID = 2L;
+
+  private final ImportedTableInfo tableInfo;
+
+  public ImportTable(String user, String tableName, Set<String> exportDirs, NamespaceId namespaceId,
+      boolean keepMappings, boolean keepOffline) {
+    tableInfo = new ImportedTableInfo();
+    tableInfo.tableName = tableName;
+    tableInfo.user = user;
+    tableInfo.namespaceId = namespaceId;
+    tableInfo.directories = parseExportDir(exportDirs);
+    tableInfo.keepMappings = keepMappings;
+    tableInfo.keepOffline = keepOffline;
+  }
+
+  @Override
+  public long isReady(FateId fateId, FateEnv environment) throws Exception {
+    long result = 0;
+    for (ImportedTableInfo.DirectoryMapping dm : tableInfo.directories) {
+      result += Utils.reserveHdfsDirectory(environment.getContext(),
+          new Path(dm.exportDir).toString(), fateId);
+    }
+    result += Utils.reserveNamespace(environment.getContext(), tableInfo.namespaceId, fateId,
+        LockType.READ, true, TableOperation.IMPORT);
+    return result;
+  }
+
+  @Override
+  public Repo<FateEnv> call(FateId fateId, FateEnv env) throws Exception {
+    checkVersions(env.getContext());
+
+    // first step is to reserve a table id.. if the machine fails during this step
+    // it is ok to retry... the only side effect is that a table id may not be used
+    // or skipped
+
+    // assuming only the manager process is creating tables
+
+    tableInfo.tableId = Utils.getNextId(tableInfo.tableName, env.getContext(), TableId::of);
+    return new ImportSetupPermissions(tableInfo);
+
+  }
+
+  @SuppressFBWarnings(value = "OS_OPEN_STREAM",
+      justification = "closing intermediate readers would close the ZipInputStream")
+  public void checkVersions(ServerContext ctx) throws AcceptableThriftTableOperationException {
+    Set<String> exportDirs =
+        tableInfo.directories.stream().map(dm -> dm.exportDir).collect(Collectors.toSet());
+
+    log.debug("Searching for export file in {}", exportDirs);
+
+    tableInfo.exportedVersion = null;
+    Integer dataVersion = null;
+
+    try {
+      Path exportFilePath = TableOperationsImpl.findExportFile(ctx, exportDirs);
+      tableInfo.exportFile = exportFilePath.toString();
+      log.info("Export file is {}", tableInfo.exportFile);
+
+      ZipInputStream zis = new ZipInputStream(ctx.getVolumeManager().open(exportFilePath));
+      ZipEntry zipEntry;
+      while ((zipEntry = zis.getNextEntry()) != null) {
+        if (zipEntry.getName().equals(Constants.EXPORT_INFO_FILE)) {
+          BufferedReader in = new BufferedReader(new InputStreamReader(zis, UTF_8));
+          String line = null;
+          while ((line = in.readLine()) != null) {
+            String[] sa = line.split(":", 2);
+            if (sa[0].equals(ExportTable.EXPORT_VERSION_PROP)) {
+              tableInfo.exportedVersion = Integer.parseInt(sa[1]);
+            } else if (sa[0].equals(ExportTable.DATA_VERSION_PROP)) {
+              dataVersion = Integer.parseInt(sa[1]);
+            }
+          }
+          break;
+        }
+      }
+    } catch (IOException | AccumuloException e) {
+      log.warn("{}", e.getMessage(), e);
+      throw new AcceptableThriftTableOperationException(null, tableInfo.tableName,
+          TableOperation.IMPORT, TableOperationExceptionType.OTHER,
+          "Failed to read export metadata " + e.getMessage());
+    }
+
+    if (tableInfo.exportedVersion == null || tableInfo.exportedVersion > ExportTable.CURR_VERSION) {
+      throw new AcceptableThriftTableOperationException(null, tableInfo.tableName,
+          TableOperation.IMPORT, TableOperationExceptionType.OTHER,
+          "Incompatible export version " + tableInfo.exportedVersion);
+    }
+
+    if (dataVersion == null || dataVersion > AccumuloDataVersion.get()) {
+      throw new AcceptableThriftTableOperationException(null, tableInfo.tableName,
+          TableOperation.IMPORT, TableOperationExceptionType.OTHER,
+          "Incompatible data version " + dataVersion);
+    }
+  }
+
+  @Override
+  public void undo(FateId fateId, FateEnv env) throws Exception {
+    for (ImportedTableInfo.DirectoryMapping dm : tableInfo.directories) {
+      Utils.unreserveHdfsDirectory(env.getContext(), new Path(dm.exportDir).toString(), fateId);
+    }
+
+    Utils.unreserveNamespace(env.getContext(), tableInfo.namespaceId, fateId, LockType.READ);
+  }
+
+  static ArrayList<ImportedTableInfo.DirectoryMapping> parseExportDir(Set<String> exportDirs) {
+    if (exportDirs == null || exportDirs.isEmpty()) {
+      return new ArrayList<>();
+    }
+
+    return exportDirs.stream().filter(not(String::isEmpty))
+        .map(ImportedTableInfo.DirectoryMapping::new)
+        .collect(Collectors.toCollection(ArrayList::new));
+  }
+}

@@ -1,0 +1,110 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+"use strict";
+
+var bulkListTable;
+
+/**
+ * Fetches new data and updates DataTables with it
+ */
+function refreshBulkImport() {
+  ajaxReloadTable(bulkListTable);
+}
+
+/**
+ * Used to redraw the page
+ */
+function refresh() {
+  refreshBulkImport();
+}
+
+/**
+ * Initializes the bulk import DataTables
+ */
+$(function () {
+
+  const url = contextPath + 'rest/bulkImports';
+  console.debug('REST url used to fetch data for the DataTables in bulkImport.js: ' + url);
+
+  // Generates the manager bulk import status table
+  bulkListTable = $('#bulkListTable').DataTable({
+    "ajax": {
+      "url": url,
+      "dataSrc": "bulkImport"
+    },
+    "stateSave": true,
+    "autoWidth": false,
+    "columns": [{
+        "data": "filename",
+        "width": "40%"
+      },
+      {
+        "data": "age",
+        "width": "45%",
+        "render": function (data, type) {
+          var age = Number(data);
+          if (type === 'display') {
+            return age > 0 ? new Date(age) : "-";
+          }
+          return age > 0 ? age : 0;
+        }
+      },
+      {
+        "data": "state",
+        "width": "15%"
+      }
+    ]
+  });
+
+  // Generates the bulkPerServerTable DataTable
+  bulkPerServerTable = $('#bulkPerServerTable').DataTable({
+    "ajax": {
+      "url": url,
+      "dataSrc": "tabletServerBulkImport"
+    },
+    "stateSave": true,
+    "columns": [{
+        "data": "server",
+        "type": "html",
+        "render": function (data, type) {
+          if (type === 'display') {
+            data = `<a href="tservers?s=${data}">${data}</a>`;
+          }
+          return data;
+        }
+      },
+      {
+        "data": "importSize"
+      },
+      {
+        "data": "oldestAge",
+        "render": function (data, type) {
+          var age = Number(data);
+          if (type === 'display') {
+            return age > 0 ? new Date(age) : "-";
+          }
+          return age > 0 ? age : 0;
+        }
+      }
+    ]
+  });
+
+  refreshBulkImport();
+
+});

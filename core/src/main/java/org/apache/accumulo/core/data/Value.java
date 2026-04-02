@@ -1,0 +1,463 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.data;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
+import static org.apache.accumulo.core.util.ByteBufferUtil.toBytes;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
+
+import org.apache.accumulo.core.file.rfile.VectorCompression;
+import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.Text;
+import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableComparator;
+
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
+/**
+ * A byte sequence that is usable as a key or value. Based on
+ * {@link org.apache.hadoop.io.BytesWritable} only this class is NOT resizable and DOES NOT
+ * distinguish between the size of the sequence and the current capacity as
+ * {@link org.apache.hadoop.io.BytesWritable} does. Hence it is comparatively 'immutable'.
+ */
+@SuppressFBWarnings(value = "CT_CONSTRUCTOR_THROW",
+    justification = "Constructor validation is required for proper initialization")
+public class Value implements WritableComparable<Object> {
+  private static final byte[] EMPTY = new byte[0];
+  protected byte[] value;
+  protected ValueType valueType = ValueType.BYTES; // Default to BYTES type for backward
+                                                   // compatibility
+
+  /**
+   * Creates a zero-size sequence.
+   */
+  public Value() {
+    this(EMPTY, false);
+  }
+
+  /**
+   * Creates a value using the UTF-8 encoding of the CharSequence
+   *
+   * @param cs may not be null
+   *
+   * @since 1.8.0
+   */
+  public Value(CharSequence cs) {
+    this(cs.toString().getBytes(UTF_8));
+  }
+
+  /**
+   * Creates a Value using the bytes of the Text. Makes a copy, does not use the byte array from the
+   * Text.
+   *
+   * @param text may not be null
+   *
+   * @since 1.8.0
+   */
+  public Value(Text text) {
+    this(text.getBytes(), 0, text.getLength());
+  }
+
+  /**
+   * Creates a Value using a byte array as the initial value. The given byte array is used directly
+   * as the backing array, so later changes made to the array reflect into the new Value.
+   *
+   * @param bytes May not be null
+   */
+  public Value(byte[] bytes) {
+    this(bytes, false);
+  }
+
+  /**
+   * Creates a Value using the bytes in a buffer as the initial value. Makes a defensive copy.
+   *
+   * @param bytes May not be null
+   */
+  public Value(ByteBuffer bytes) {
+    /* TODO ACCUMULO-2509 right now this uses the entire backing array, which must be accessible. */
+    this(toBytes(bytes), false);
+  }
+
+  /**
+   * Creates a Value using a byte array as the initial value.
+   *
+   * @param bytes may not be null
+   * @param copy false to use the given byte array directly as the backing array, true to force a
+   *        copy
+   */
+  public Value(byte[] bytes, boolean copy) {
+    requireNonNull(bytes);
+    if (copy) {
+      this.value = new byte[bytes.length];
+      System.arraycopy(bytes, 0, this.value, 0, bytes.length);
+    } else {
+      this.value = bytes;
+    }
+
+  }
+
+  /**
+   * Creates a new Value based on another.
+   *
+   * @param ibw may not be null.
+   */
+  public Value(final Value ibw) {
+    this(ibw.get(), 0, ibw.getSize());
+  }
+
+  /**
+   * Creates a Value based on a range in a byte array. A copy of the bytes is always made.
+   *
+   * @param newData source of copy, may not be null
+   * @param offset the offset in newData to start with for value bytes
+   * @param length the number of bytes in the value
+   * @throws IndexOutOfBoundsException if offset or length are invalid
+   */
+  public Value(final byte[] newData, final int offset, final int length) {
+    requireNonNull(newData);
+    this.value = new byte[length];
+    System.arraycopy(newData, offset, this.value, 0, length);
+  }
+
+  /**
+   * Gets the byte data of this value.
+   *
+   * @return the underlying byte array directly.
+   */
+  public byte[] get() {
+    assert (value != null);
+    return this.value;
+  }
+
+  /**
+   * Sets the byte data of this value. The given byte array is used directly as the backing array,
+   * so later changes made to the array reflect into this Value.
+   *
+   * @param b may not be null
+   */
+  public void set(final byte[] b) {
+    requireNonNull(b);
+    this.value = b;
+  }
+
+  /**
+   * Sets the byte data of this value. The given byte array is copied.
+   *
+   * @param b may not be null
+   */
+  public void copy(byte[] b) {
+    requireNonNull(b);
+    this.value = new byte[b.length];
+    System.arraycopy(b, 0, this.value, 0, b.length);
+  }
+
+  /**
+   * Gets the size of this value.
+   *
+   * @return size in bytes
+   */
+  public int getSize() {
+    assert (value != null);
+    return this.value.length;
+  }
+
+  /**
+   * Gets the value type of this Value.
+   *
+   * @return the ValueType
+   */
+  public ValueType getValueType() {
+    return valueType;
+  }
+
+  /**
+   * Sets the value type of this Value.
+   *
+   * @param valueType the ValueType to set
+   */
+  public void setValueType(ValueType valueType) {
+    this.valueType = valueType;
+  }
+
+  /**
+   * Creates a new Value containing a float32 vector.
+   *
+   * @param vector the float array containing vector components
+   * @return a new Value with type VECTOR_FLOAT32
+   */
+  public static Value newVector(float[] vector) {
+    requireNonNull(vector);
+    ByteBuffer buffer = ByteBuffer.allocate(vector.length * 4); // 4 bytes per float
+    FloatBuffer floatBuffer = buffer.asFloatBuffer();
+    floatBuffer.put(vector);
+
+    Value value = new Value(buffer.array());
+    value.setValueType(ValueType.VECTOR_FLOAT32);
+    return value;
+  }
+
+  /**
+   * Interprets this Value as a float32 vector.
+   *
+   * @return the float array representation of the vector
+   * @throws IllegalStateException if this Value is not of type VECTOR_FLOAT32
+   * @throws IllegalArgumentException if the byte array length is not divisible by 4
+   */
+  public float[] asVector() {
+    if (valueType != ValueType.VECTOR_FLOAT32) {
+      throw new IllegalStateException("Value is not a VECTOR_FLOAT32 type: " + valueType);
+    }
+    if (value.length % 4 != 0) {
+      throw new IllegalArgumentException(
+          "Vector byte array length must be divisible by 4, got: " + value.length);
+    }
+
+    FloatBuffer floatBuffer = ByteBuffer.wrap(value).asFloatBuffer();
+    float[] result = new float[floatBuffer.remaining()];
+    floatBuffer.get(result);
+    return result;
+  }
+
+  @Override
+  public void readFields(final DataInput in) throws IOException {
+    this.value = new byte[in.readInt()];
+    in.readFully(this.value, 0, this.value.length);
+  }
+
+  @Override
+  public void write(final DataOutput out) throws IOException {
+    out.writeInt(this.value.length);
+    out.write(this.value, 0, this.value.length);
+  }
+
+  // Below methods copied from BytesWritable
+
+  @Override
+  public int hashCode() {
+    return WritableComparator.hashBytes(value, this.value.length);
+  }
+
+  /**
+   * Define the sort order of the BytesWritable.
+   *
+   * @param right_obj The other bytes writable
+   * @return Positive if left is bigger than right, 0 if they are equal, and negative if left is
+   *         smaller than right.
+   */
+  @Override
+  public int compareTo(Object right_obj) {
+    return compareTo(((Value) right_obj).get());
+  }
+
+  /**
+   * Compares the bytes in this object to the specified byte array
+   *
+   * @return Positive if left is bigger than right, 0 if they are equal, and negative if left is
+   *         smaller than right.
+   */
+  public int compareTo(final byte[] that) {
+    int diff = this.value.length - that.length;
+    return (diff != 0) ? diff
+        : WritableComparator.compareBytes(this.value, 0, this.value.length, that, 0, that.length);
+  }
+
+  @Override
+  public boolean equals(Object right_obj) {
+    if (right_obj instanceof Value) {
+      return compareTo(right_obj) == 0;
+    }
+    return false;
+  }
+
+  /**
+   * Compares the bytes in this object to the specified byte array
+   *
+   * @return true if the contents of this Value is equivalent to the supplied byte array
+   * @since 2.0.0
+   */
+  public boolean contentEquals(byte[] right_obj) {
+    return compareTo(right_obj) == 0;
+  }
+
+  @Override
+  public String toString() {
+    return new String(get(), UTF_8);
+  }
+
+  /**
+   * A Comparator optimized for Value.
+   */
+  public static class Comparator extends WritableComparator {
+    private final BytesWritable.Comparator comparator = new BytesWritable.Comparator();
+
+    /** constructor */
+    public Comparator() {
+      super(Value.class);
+    }
+
+    @Override
+    public int compare(byte[] b1, int s1, int l1, byte[] b2, int s2, int l2) {
+      return comparator.compare(b1, s1, l1, b2, s2, l2);
+    }
+  }
+
+  static { // register this comparator
+    WritableComparator.define(Value.class, new Comparator());
+  }
+
+  /**
+   * Splits a large vector into multiple Values for storage across multiple key-value pairs. This
+   * enables support for very large embeddings that exceed single value size limits.
+   *
+   * @param largeVector the vector to split
+   * @param chunkSize maximum number of float components per chunk
+   * @return array of Value objects containing vector chunks
+   */
+  public static Value[] chunkVector(float[] largeVector, int chunkSize) {
+    requireNonNull(largeVector);
+    if (chunkSize <= 0) {
+      throw new IllegalArgumentException("Chunk size must be positive");
+    }
+
+    int numChunks = (largeVector.length + chunkSize - 1) / chunkSize; // Ceiling division
+    Value[] chunks = new Value[numChunks];
+
+    for (int chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+      int startIdx = chunkIdx * chunkSize;
+      int endIdx = Math.min(startIdx + chunkSize, largeVector.length);
+      int currentChunkSize = endIdx - startIdx;
+
+      float[] chunk = new float[currentChunkSize];
+      System.arraycopy(largeVector, startIdx, chunk, 0, currentChunkSize);
+      chunks[chunkIdx] = Value.newVector(chunk);
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Reassembles a vector from multiple Value chunks.
+   *
+   * @param chunks array of Value objects containing vector chunks
+   * @return the reassembled complete vector
+   * @throws IllegalArgumentException if any chunk is not a vector type
+   */
+  public static float[] reassembleVector(Value[] chunks) {
+    requireNonNull(chunks);
+    if (chunks.length == 0) {
+      return new float[0];
+    }
+
+    // Calculate total size
+    int totalSize = 0;
+    for (Value chunk : chunks) {
+      if (chunk.getValueType() != ValueType.VECTOR_FLOAT32) {
+        throw new IllegalArgumentException("All chunks must be vector types");
+      }
+      totalSize += chunk.asVector().length;
+    }
+
+    // Reassemble vector
+    float[] result = new float[totalSize];
+    int offset = 0;
+    for (Value chunk : chunks) {
+      float[] chunkVector = chunk.asVector();
+      System.arraycopy(chunkVector, 0, result, offset, chunkVector.length);
+      offset += chunkVector.length;
+    }
+
+    return result;
+  }
+
+  /**
+   * Creates a compressed vector Value using the specified compression type.
+   *
+   * @param vector the vector to compress
+   * @param compressionType the compression method to use
+   * @return a new Value containing compressed vector data
+   */
+  public static Value newCompressedVector(float[] vector, byte compressionType) {
+    requireNonNull(vector);
+
+    VectorCompression.CompressedVector compressed;
+    switch (compressionType) {
+      case VectorCompression.COMPRESSION_QUANTIZED_8BIT:
+        compressed = VectorCompression.compress8Bit(vector);
+        break;
+      case VectorCompression.COMPRESSION_QUANTIZED_16BIT:
+        compressed = VectorCompression.compress16Bit(vector);
+        break;
+      case VectorCompression.COMPRESSION_NONE:
+      default:
+        return newVector(vector); // No compression
+    }
+
+    // Store compressed data with metadata
+    ByteBuffer buffer = ByteBuffer.allocate(compressed.getData().length + 12); // data + 3 floats
+    buffer.put(compressed.getData());
+    buffer.putFloat(compressed.getMin());
+    buffer.putFloat(compressed.getMax());
+    buffer.putFloat(compressionType); // Store as float for simplicity
+
+    Value value = new Value(buffer.array());
+    value.setValueType(ValueType.VECTOR_FLOAT32);
+    return value;
+  }
+
+  /**
+   * Decompresses a vector Value that was created with compression.
+   *
+   * @return the decompressed float array
+   * @throws IllegalStateException if this Value is not a compressed vector
+   */
+  public float[] asCompressedVector() {
+    if (valueType != ValueType.VECTOR_FLOAT32) {
+      throw new IllegalStateException("Value is not a vector type");
+    }
+
+    ByteBuffer buffer = ByteBuffer.wrap(value);
+
+    // Check if this looks like compressed data (has metadata at end)
+    if (buffer.remaining() < 12) {
+      // Assume uncompressed
+      return asVector();
+    }
+
+    // Extract compression metadata from end
+    int dataLength = buffer.remaining() - 12;
+    byte[] compressedData = new byte[dataLength];
+    buffer.get(compressedData);
+
+    float min = buffer.getFloat();
+    float max = buffer.getFloat();
+    byte compressionType = (byte) buffer.getFloat();
+
+    VectorCompression.CompressedVector compressed =
+        new VectorCompression.CompressedVector(compressedData, min, max, compressionType);
+
+    return VectorCompression.decompress(compressed);
+  }
+
+}

@@ -1,0 +1,579 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.tserver.tablet;
+
+import static java.util.Objects.requireNonNull;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+
+import org.apache.accumulo.core.conf.AccumuloConfiguration;
+import org.apache.accumulo.core.conf.Property;
+import org.apache.accumulo.core.data.ByteSequence;
+import org.apache.accumulo.core.data.Key;
+import org.apache.accumulo.core.data.Range;
+import org.apache.accumulo.core.data.Value;
+import org.apache.accumulo.core.dataImpl.KeyExtent;
+import org.apache.accumulo.core.iterators.SortedKeyValueIterator;
+import org.apache.accumulo.core.iterators.YieldCallback;
+import org.apache.accumulo.core.iteratorsImpl.system.IterationInterruptedException;
+import org.apache.accumulo.core.iteratorsImpl.system.SourceSwitchingIterator;
+import org.apache.accumulo.core.metadata.StoredTabletFile;
+import org.apache.accumulo.core.metadata.SystemTables;
+import org.apache.accumulo.core.metadata.schema.DataFileValue;
+import org.apache.accumulo.core.sample.impl.SamplerConfigurationImpl;
+import org.apache.accumulo.core.security.ColumnVisibility;
+import org.apache.accumulo.core.spi.cache.CacheType;
+import org.apache.accumulo.core.trace.ScanInstrumentation;
+import org.apache.accumulo.core.trace.TraceAttributes;
+import org.apache.accumulo.core.trace.TraceUtil;
+import org.apache.accumulo.core.util.CountDownTimer;
+import org.apache.accumulo.core.util.LocalityGroupUtil;
+import org.apache.accumulo.core.util.Pair;
+import org.apache.accumulo.core.util.ShutdownUtil;
+import org.apache.accumulo.server.ServerContext;
+import org.apache.accumulo.server.conf.TableConfiguration;
+import org.apache.accumulo.server.fs.TooManyFilesException;
+import org.apache.accumulo.server.mem.LowMemoryDetector.DetectionScope;
+import org.apache.accumulo.tserver.InMemoryMap;
+import org.apache.accumulo.tserver.TabletHostingServer;
+import org.apache.accumulo.tserver.TabletServerResourceManager;
+import org.apache.accumulo.tserver.metrics.TabletServerScanMetrics;
+import org.apache.accumulo.tserver.scan.ScanParameters;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.opentelemetry.api.trace.Span;
+
+/**
+ * This class exists to share code for scanning a tablet between {@link Tablet} and
+ * {@link SnapshotTablet}
+ */
+public abstract class TabletBase {
+
+  private static final Logger log = LoggerFactory.getLogger(TabletBase.class);
+
+  private static final byte[] EMPTY_BYTES = new byte[0];
+
+  protected final KeyExtent extent;
+  protected final ServerContext context;
+  private final TabletHostingServer server;
+
+  protected final AtomicLong lookupCount = new AtomicLong(0);
+  protected final AtomicLong queryResultCount = new AtomicLong(0);
+  protected final AtomicLong queryResultBytes = new AtomicLong(0);
+  protected final LongAdder scannedCount = new LongAdder();
+
+  protected final Set<ScanDataSource> activeScans = new HashSet<>();
+
+  private final AccumuloConfiguration.Deriver<byte[]> defaultSecurityLabel;
+
+  protected final TableConfiguration tableConfiguration;
+
+  private final boolean isUserTable;
+
+  public TabletBase(TabletHostingServer server, KeyExtent extent) {
+    this.context = server.getContext();
+    this.server = server;
+    this.extent = extent;
+    this.isUserTable = !SystemTables.containsTableId(extent.tableId());
+
+    TableConfiguration tblConf = context.getTableConfiguration(extent.tableId());
+    if (tblConf == null) {
+      context.clearTableListCache();
+      tblConf = context.getTableConfiguration(extent.tableId());
+      requireNonNull(tblConf, "Could not get table configuration for " + extent.tableId());
+    }
+
+    this.tableConfiguration = tblConf;
+
+    if (extent.isMeta()) {
+      defaultSecurityLabel = () -> EMPTY_BYTES;
+    } else {
+      defaultSecurityLabel = tableConfiguration.newDeriver(
+          conf -> new ColumnVisibility(conf.get(Property.TABLE_DEFAULT_SCANTIME_VISIBILITY))
+              .getExpression());
+    }
+  }
+
+  protected boolean disallowNewReservations(ScanParameters scanParameters) {
+    var scanSessId = scanParameters.getScanSessionId();
+    if (scanSessId != null) {
+      return server.getSessionManager().disallowNewReservations(scanSessId);
+    } else {
+      return true;
+    }
+  }
+
+  public abstract boolean isClosed();
+
+  public abstract Map<StoredTabletFile,DataFileValue> getDatafiles();
+
+  public abstract void addToYieldMetric(int i);
+
+  public abstract long getDataSourceDeletions();
+
+  abstract TabletServerResourceManager.TabletResourceManager getTabletResources();
+
+  public abstract List<InMemoryMap.MemoryIterator>
+      getMemIterators(SamplerConfigurationImpl samplerConfig);
+
+  public abstract void returnMemIterators(List<InMemoryMap.MemoryIterator> iters);
+
+  public abstract Pair<Long,Map<StoredTabletFile,DataFileValue>> reserveFilesForScan();
+
+  public abstract void returnFilesForScan(long scanId);
+
+  public abstract TabletServerScanMetrics getScanMetrics();
+
+  protected ScanDataSource createDataSource(ScanParameters scanParams, boolean loadIters,
+      AtomicBoolean interruptFlag) {
+    return new ScanDataSource(this, scanParams, loadIters, interruptFlag);
+  }
+
+  public Scanner createScanner(Range range, ScanParameters scanParams,
+      AtomicBoolean interruptFlag) {
+    // do a test to see if this range falls within the tablet, if it does not
+    // then clip will throw an exception
+    extent.toDataRange().clip(range);
+
+    return new Scanner(this, range, scanParams, interruptFlag);
+  }
+
+  public LongAdder getScannedCounter() {
+    return this.scannedCount;
+  }
+
+  public ServerContext getContext() {
+    return context;
+  }
+
+  public TableConfiguration getTableConfiguration() {
+    return tableConfiguration;
+  }
+
+  public KeyExtent getExtent() {
+    return extent;
+  }
+
+  public byte[] getDefaultSecurityLabels() {
+    return defaultSecurityLabel.derive();
+  }
+
+  public synchronized void addActiveScans(ScanDataSource scanDataSource) {
+    activeScans.add(scanDataSource);
+  }
+
+  public int removeScan(ScanDataSource scanDataSource) {
+    activeScans.remove(scanDataSource);
+    return activeScans.size();
+  }
+
+  public abstract void close(boolean b) throws IOException;
+
+  public Tablet.LookupResult lookup(List<Range> ranges, List<KVEntry> results,
+      ScanParameters scanParams, long maxResultSize, AtomicBoolean interruptFlag)
+      throws IOException {
+
+    if (ranges.isEmpty()) {
+      return new Tablet.LookupResult();
+    }
+
+    ranges = Range.mergeOverlapping(ranges);
+    if (ranges.size() > 1) {
+      Collections.sort(ranges);
+    }
+
+    Range tabletRange = getExtent().toDataRange();
+    for (Range range : ranges) {
+      // do a test to see if this range falls within the tablet, if it does not
+      // then clip will throw an exception
+      tabletRange.clip(range);
+    }
+
+    ScanDataSource dataSource = createDataSource(scanParams, true, interruptFlag);
+
+    Tablet.LookupResult result = null;
+
+    boolean sawException = false;
+    var span = TraceUtil.startSpan(TabletBase.class, "multiscan-batch");
+    try (var scope = span.makeCurrent(); var scanScope = ScanInstrumentation.enable(span)) {
+      SortedKeyValueIterator<Key,Value> iter = new SourceSwitchingIterator(dataSource);
+      this.lookupCount.incrementAndGet();
+      this.server.getScanMetrics().incrementLookupCount();
+      result = lookup(iter, ranges, results, scanParams, maxResultSize);
+      // must close data source before recording scan trace in order to flush all file read stats
+      dataSource.close(false);
+      recordScanTrace(span, results, scanParams, dataSource);
+      return result;
+    } catch (IOException | RuntimeException e) {
+      sawException = true;
+      span.recordException(e);
+      throw e;
+    } finally {
+      // code in finally block because always want
+      // to return data files, even when exception is thrown
+      dataSource.close(sawException);
+      span.end();
+
+      synchronized (this) {
+        queryResultCount.addAndGet(results.size());
+        this.server.getScanMetrics().incrementQueryResultCount(results.size());
+        if (result != null) {
+          this.queryResultBytes.addAndGet(result.dataSize);
+          this.server.getScanMetrics().incrementQueryResultBytes(result.dataSize);
+        }
+      }
+    }
+  }
+
+  void recordScanTrace(Span span, List<KVEntry> batch, ScanParameters scanParameters,
+      ScanDataSource dataSource) {
+    if (span.isRecording()) {
+      span.setAttribute(TraceAttributes.ENTRIES_RETURNED_KEY, batch.size());
+      long bytesReturned = 0;
+      for (var e : batch) {
+        bytesReturned += e.getKey().getLength() + e.getValue().get().length;
+      }
+      span.setAttribute(TraceAttributes.BYTES_RETURNED_KEY, bytesReturned);
+      span.setAttribute(TraceAttributes.EXECUTOR_KEY,
+          scanParameters.getScanDispatch().getExecutorName());
+      span.setAttribute(TraceAttributes.TABLE_ID_KEY, getExtent().tableId().canonical());
+      span.setAttribute(TraceAttributes.EXTENT_KEY, getExtent().toString());
+      var si = ScanInstrumentation.get();
+      span.setAttribute(TraceAttributes.BYTES_READ_FILE_KEY, si.getFileBytesRead());
+      span.setAttribute(TraceAttributes.BYTES_READ_KEY, si.getUncompressedBytesRead());
+      span.setAttribute(TraceAttributes.INDEX_HITS_KEY, si.getCacheHits(CacheType.INDEX));
+      span.setAttribute(TraceAttributes.INDEX_MISSES_KEY, si.getCacheMisses(CacheType.INDEX));
+      span.setAttribute(TraceAttributes.INDEX_BYPASSES_KEY, si.getCacheBypasses(CacheType.INDEX));
+      span.setAttribute(TraceAttributes.DATA_HITS_KEY, si.getCacheHits(CacheType.DATA));
+      span.setAttribute(TraceAttributes.DATA_MISSES_KEY, si.getCacheMisses(CacheType.DATA));
+      span.setAttribute(TraceAttributes.DATA_BYPASSES_KEY, si.getCacheBypasses(CacheType.DATA));
+      span.setAttribute(TraceAttributes.SERVER_KEY, server.getAdvertiseAddress().toString());
+
+      dataSource.setAttributes(span);
+    }
+  }
+
+  Batch nextBatch(SortedKeyValueIterator<Key,Value> iter, Range range, ScanParameters scanParams)
+      throws IOException {
+
+    while (context.getLowMemoryDetector().isRunningLowOnMemory(context, DetectionScope.SCAN, () -> {
+      return isUserTable;
+    }, () -> {
+      log.info("Not starting next batch because low on memory, extent: {}", extent);
+      server.getScanMetrics().incrementScanPausedForLowMemory();
+      try {
+        Thread.sleep(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(
+            "Interrupted while waiting for low memory condition to resolve", e);
+      }
+    })) {}
+
+    long batchTimeOut = scanParams.getBatchTimeOut();
+
+    if (batchTimeOut == Long.MAX_VALUE || batchTimeOut <= 0) {
+      batchTimeOut = 0;
+    }
+
+    CountDownTimer runTimer = CountDownTimer.startNew(Duration.ofMillis(batchTimeOut));
+    List<KVEntry> results = new ArrayList<>();
+    Key key = null;
+
+    Value value;
+    long resultSize = 0L;
+    long resultBytes = 0L;
+
+    long maxResultsSize = getTableConfiguration().getAsBytes(Property.TABLE_SCAN_MAXMEM);
+
+    Key continueKey = null;
+    boolean skipContinueKey = false;
+
+    YieldCallback<Key> yield = new YieldCallback<>();
+
+    // we cannot yield if we are in isolation mode
+    if (!scanParams.isIsolated()) {
+      iter.enableYielding(yield);
+    }
+
+    if (scanParams.getColumnSet().isEmpty()) {
+      iter.seek(range, Set.of(), false);
+    } else {
+      iter.seek(range, LocalityGroupUtil.families(scanParams.getColumnSet()), true);
+    }
+
+    while (iter.hasTop()) {
+      if (yield.hasYielded()) {
+        throw new IOException(
+            "Coding error: hasTop returned true but has yielded at " + yield.getPositionAndReset());
+      }
+      value = iter.getTopValue();
+      key = iter.getTopKey();
+
+      KVEntry kvEntry = new KVEntry(key, value); // copies key and value
+      results.add(kvEntry);
+      resultSize += kvEntry.estimateMemoryUsed();
+      resultBytes += kvEntry.numBytes();
+
+      boolean timesUp = batchTimeOut > 0 && runTimer.isExpired();
+
+      boolean runningLowOnMemory =
+          context.getLowMemoryDetector().isRunningLowOnMemory(context, DetectionScope.SCAN, () -> {
+            return isUserTable;
+          }, () -> {
+            log.info("Not continuing next batch because low on memory, extent: {}", extent);
+            server.getScanMetrics().incrementEarlyReturnForLowMemory();
+          });
+      if (runningLowOnMemory || resultSize >= maxResultsSize
+          || results.size() >= scanParams.getMaxEntries() || timesUp) {
+        continueKey = new Key(key);
+        skipContinueKey = true;
+        break;
+      }
+
+      iter.next();
+    }
+
+    if (yield.hasYielded()) {
+      continueKey = new Key(yield.getPositionAndReset());
+      skipContinueKey = true;
+      if (!range.contains(continueKey)) {
+        throw new IOException("Underlying iterator yielded to a position outside of its range: "
+            + continueKey + " not in " + range);
+      }
+      if (!results.isEmpty()
+          && continueKey.compareTo(results.get(results.size() - 1).getKey()) <= 0) {
+        throw new IOException(
+            "Underlying iterator yielded to a position that does not follow the last key returned: "
+                + continueKey + " <= " + results.get(results.size() - 1).getKey());
+      }
+
+      log.debug("Scan yield detected at position " + continueKey);
+      addToYieldMetric(1);
+    } else if (!iter.hasTop()) {
+      // end of tablet has been reached
+      continueKey = null;
+      if (results.isEmpty()) {
+        results = null;
+      }
+    }
+
+    return new Batch(skipContinueKey, results, continueKey, resultBytes);
+  }
+
+  private Tablet.LookupResult lookup(SortedKeyValueIterator<Key,Value> mmfi, List<Range> ranges,
+      List<KVEntry> results, ScanParameters scanParams, long maxResultsSize) throws IOException {
+
+    while (context.getLowMemoryDetector().isRunningLowOnMemory(context, DetectionScope.SCAN, () -> {
+      return isUserTable;
+    }, () -> {
+      log.info("Not starting lookup because low on memory, extent: {}", extent);
+      server.getScanMetrics().incrementScanPausedForLowMemory();
+      try {
+        Thread.sleep(500);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(
+            "Interrupted while waiting for low memory condition to resolve", e);
+      }
+    })) {}
+
+    Tablet.LookupResult lookupResult = new Tablet.LookupResult();
+
+    boolean exceededMemoryUsage = false;
+    boolean tabletClosed = false;
+
+    Set<ByteSequence> cfset = null;
+    if (!scanParams.getColumnSet().isEmpty()) {
+      cfset = LocalityGroupUtil.families(scanParams.getColumnSet());
+    }
+
+    long batchTimeOut = scanParams.getBatchTimeOut();
+
+    if (batchTimeOut <= 0 || batchTimeOut == Long.MAX_VALUE) {
+      batchTimeOut = 0;
+    }
+
+    CountDownTimer runTimer = CountDownTimer.startNew(Duration.ofMillis(batchTimeOut));
+
+    // determine if the iterator supported yielding
+    YieldCallback<Key> yield = new YieldCallback<>();
+    mmfi.enableYielding(yield);
+    boolean yielded = false;
+
+    for (Range range : ranges) {
+
+      boolean timesUp = batchTimeOut > 0 && runTimer.isExpired();
+
+      boolean runningLowOnMemory =
+          context.getLowMemoryDetector().isRunningLowOnMemory(context, DetectionScope.SCAN, () -> {
+            return isUserTable;
+          }, () -> {
+            log.info("Not continuing lookup because low on memory, extent: {}", extent);
+            server.getScanMetrics().incrementEarlyReturnForLowMemory();
+          });
+      if (runningLowOnMemory || exceededMemoryUsage || tabletClosed || timesUp || yielded) {
+        lookupResult.unfinishedRanges.add(range);
+        continue;
+      }
+
+      int entriesAdded = 0;
+
+      try {
+        if (cfset != null) {
+          mmfi.seek(range, cfset, true);
+        } else {
+          mmfi.seek(range, Set.of(), false);
+        }
+
+        while (mmfi.hasTop()) {
+          if (yield.hasYielded()) {
+            throw new IOException("Coding error: hasTop returned true but has yielded at "
+                + yield.getPositionAndReset());
+          }
+          Key key = mmfi.getTopKey();
+
+          KVEntry kve = new KVEntry(key, mmfi.getTopValue());
+          results.add(kve);
+          entriesAdded++;
+          lookupResult.bytesAdded += kve.estimateMemoryUsed();
+          lookupResult.dataSize += kve.numBytes();
+
+          exceededMemoryUsage = lookupResult.bytesAdded > maxResultsSize;
+
+          timesUp = batchTimeOut > 0 && runTimer.isExpired();
+
+          runningLowOnMemory = context.getLowMemoryDetector().isRunningLowOnMemory(context,
+              DetectionScope.SCAN, () -> {
+                return isUserTable;
+              }, () -> {
+                log.info("Not continuing lookup because low on memory, extent: {}", extent);
+                server.getScanMetrics().incrementEarlyReturnForLowMemory();
+              });
+          if (runningLowOnMemory || exceededMemoryUsage || timesUp) {
+            addUnfinishedRange(lookupResult, range, key);
+            break;
+          }
+
+          mmfi.next();
+        }
+
+        if (yield.hasYielded()) {
+          yielded = true;
+          Key yieldPosition = yield.getPositionAndReset();
+          if (!range.contains(yieldPosition)) {
+            throw new IOException("Underlying iterator yielded to a position outside of its range: "
+                + yieldPosition + " not in " + range);
+          }
+          if (!results.isEmpty()
+              && yieldPosition.compareTo(results.get(results.size() - 1).getKey()) <= 0) {
+            throw new IOException("Underlying iterator yielded to a position"
+                + " that does not follow the last key returned: " + yieldPosition + " <= "
+                + results.get(results.size() - 1).getKey());
+          }
+          addUnfinishedRange(lookupResult, range, yieldPosition);
+
+          log.debug("Scan yield detected at position " + yieldPosition);
+          addToYieldMetric(1);
+        }
+      } catch (TooManyFilesException tmfe) {
+        // treat this as a closed tablet, and let the client retry
+        log.warn("Tablet {} has too many files, batch lookup can not run", getExtent());
+        handleTabletClosedDuringScan(results, lookupResult, exceededMemoryUsage, range,
+            entriesAdded);
+        tabletClosed = true;
+      } catch (IOException ioe) {
+        if (ShutdownUtil.wasCausedByHadoopShutdown(ioe)) {
+          // assume HDFS shutdown hook caused this exception
+          log.debug("IOException while shutdown in progress", ioe);
+          handleTabletClosedDuringScan(results, lookupResult, exceededMemoryUsage, range,
+              entriesAdded);
+          tabletClosed = true;
+        } else {
+          throw ioe;
+        }
+      } catch (IterationInterruptedException iie) {
+        if (isClosed()) {
+          handleTabletClosedDuringScan(results, lookupResult, exceededMemoryUsage, range,
+              entriesAdded);
+          tabletClosed = true;
+        } else {
+          throw iie;
+        }
+      } catch (TabletClosedException tce) {
+        handleTabletClosedDuringScan(results, lookupResult, exceededMemoryUsage, range,
+            entriesAdded);
+        tabletClosed = true;
+      } catch (RuntimeException re) {
+        if (ShutdownUtil.wasCausedByHadoopShutdown(re)) {
+          log.debug("RuntimeException while shutdown in progress", re);
+          handleTabletClosedDuringScan(results, lookupResult, exceededMemoryUsage, range,
+              entriesAdded);
+          tabletClosed = true;
+        } else {
+          throw re;
+        }
+      }
+
+    }
+
+    return lookupResult;
+  }
+
+  private void handleTabletClosedDuringScan(List<KVEntry> results, Tablet.LookupResult lookupResult,
+      boolean exceededMemoryUsage, Range range, int entriesAdded) {
+    if (exceededMemoryUsage) {
+      throw new IllegalStateException(
+          "Tablet " + getExtent() + "should not exceed memory usage or close, not both");
+    }
+
+    if (entriesAdded > 0) {
+      addUnfinishedRange(lookupResult, range, results.get(results.size() - 1).getKey());
+    } else {
+      lookupResult.unfinishedRanges.add(range);
+    }
+
+    lookupResult.closed = true;
+  }
+
+  private void addUnfinishedRange(Tablet.LookupResult lookupResult, Range range, Key key) {
+    if (range.getEndKey() == null || key.compareTo(range.getEndKey()) < 0) {
+      Range nlur = new Range(new Key(key), false, range.getEndKey(), range.isEndKeyInclusive());
+      lookupResult.unfinishedRanges.add(nlur);
+    }
+  }
+
+  public synchronized void updateQueryStats(int size, long numBytes) {
+    this.queryResultCount.addAndGet(size);
+    this.server.getScanMetrics().incrementQueryResultCount(size);
+    this.queryResultBytes.addAndGet(numBytes);
+    this.server.getScanMetrics().incrementQueryResultBytes(numBytes);
+  }
+}

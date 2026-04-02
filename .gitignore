@@ -1,0 +1,79 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Maven ignores
+/target/
+
+# IDE ignores
+/.settings/
+/.project
+/.classpath
+/.pydevproject
+/.idea
+/*.iml
+/*.ipr
+/*.iws
+/nbproject/
+/nbactions.xml
+/nb-configuration.xml
+/.vscode/
+/.factorypath
+
+# MacOS ignores
+.DS_Store
+
+# Docker build artifacts
+docker/accumulo/dist/
+
+# Helm chart build artifacts
+charts/accumulo/charts/
+values-generated.yaml
+
+# Platform build artifacts
+platform/provisioner/target/
+platform/worker/target/
+platform/api/__pycache__/
+platform/web/.next/
+platform/web/node_modules/
+platform/docs/.next/
+platform/docs/node_modules/
+platform/docs/out/
+platform/sdk/python/dist/
+platform/sdk/python/build/
+platform/sdk/python/src/*.egg-info/
+platform/sdk/python/.publish-venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+
+# Terraform
+platform/terraform/.terraform/
+platform/terraform/*.tfstate*
+
+# Secrets / credentials
+*.json.key
+gcs-key.json
+docker/accumulo/cache/

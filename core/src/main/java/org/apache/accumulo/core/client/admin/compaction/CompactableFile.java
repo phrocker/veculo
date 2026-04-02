@@ -1,0 +1,70 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.core.client.admin.compaction;
+
+import java.net.URI;
+
+import org.apache.accumulo.core.data.RowRange;
+import org.apache.accumulo.core.metadata.CompactableFileImpl;
+
+/**
+ * A single file ready to compact, that will come in a set of possible candidates.
+ *
+ * @since 2.1.0
+ */
+public interface CompactableFile {
+
+  public String getFileName();
+
+  public URI getUri();
+
+  /**
+   * @return A range associated with the file. If a file has an associated range then Accumulo will
+   *         limit reads to within the range. Not all files have an associated range, it a file does
+   *         not have a range then an infinite range is returned. The URI plus this range uniquely
+   *         identify a file.
+   *
+   * @since 4.0.0
+   */
+  public RowRange getRange();
+
+  public long getEstimatedSize();
+
+  public long getEstimatedEntries();
+
+  /**
+   * Creates a new CompactableFile object that implements this interface. The returned object
+   * implements equals() and hashCode() based only on the file uri and an infinite range.
+   */
+  static CompactableFile create(URI uri, long estimatedSize, long estimatedEntries) {
+    return new CompactableFileImpl(uri, estimatedSize, estimatedEntries);
+  }
+
+  /**
+   * Creates a new CompactableFile object that implements this interface. The returned object
+   * implements equals() and hashCode() based only on the file uri and range.
+   *
+   * @param range must be of the form (startRow, endRow]
+   * @since 4.0.0
+   */
+  static CompactableFile create(URI uri, RowRange range, long estimatedSize,
+      long estimatedEntries) {
+    return new CompactableFileImpl(uri, range, estimatedSize, estimatedEntries);
+  }
+}

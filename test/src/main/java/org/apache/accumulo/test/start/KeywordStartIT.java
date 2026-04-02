@@ -1,0 +1,379 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.accumulo.test.start;
+
+import static org.apache.accumulo.harness.AccumuloITBase.SUNNY_DAY;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+import org.apache.accumulo.compactor.Compactor;
+import org.apache.accumulo.compactor.CompactorExecutable;
+import org.apache.accumulo.core.file.rfile.GenerateSplits;
+import org.apache.accumulo.core.file.rfile.PrintInfo;
+import org.apache.accumulo.core.file.rfile.SplitLarge;
+import org.apache.accumulo.core.util.CreateToken;
+import org.apache.accumulo.core.util.Help;
+import org.apache.accumulo.core.util.ShellCompletionCommand;
+import org.apache.accumulo.core.util.Version;
+import org.apache.accumulo.gc.GCExecutable;
+import org.apache.accumulo.gc.SimpleGarbageCollector;
+import org.apache.accumulo.manager.ManagerExecutable;
+import org.apache.accumulo.manager.state.SetGoalState;
+import org.apache.accumulo.minicluster.MiniAccumuloRunner;
+import org.apache.accumulo.miniclusterImpl.MiniClusterExecutable;
+import org.apache.accumulo.monitor.Monitor;
+import org.apache.accumulo.monitor.MonitorExecutable;
+import org.apache.accumulo.server.conf.CheckAccumuloProperties;
+import org.apache.accumulo.server.conf.CheckCompactionConfig;
+import org.apache.accumulo.server.conf.util.ZooInfoViewer;
+import org.apache.accumulo.server.conf.util.ZooPropEditor;
+import org.apache.accumulo.server.init.Initialize;
+import org.apache.accumulo.server.util.CancelCompaction;
+import org.apache.accumulo.server.util.DumpZookeeper;
+import org.apache.accumulo.server.util.FindCompactionTmpFiles;
+import org.apache.accumulo.server.util.FindOfflineTablets;
+import org.apache.accumulo.server.util.Info;
+import org.apache.accumulo.server.util.ListCompactions;
+import org.apache.accumulo.server.util.ListCompactors;
+import org.apache.accumulo.server.util.ListOnlineOnDemandTablets;
+import org.apache.accumulo.server.util.LoginProperties;
+import org.apache.accumulo.server.util.RemoveEntriesForMissingFiles;
+import org.apache.accumulo.server.util.ScanServerMetadataEntries;
+import org.apache.accumulo.server.util.UpgradeUtil;
+import org.apache.accumulo.server.util.ZooKeeperMain;
+import org.apache.accumulo.server.util.ZooZap;
+import org.apache.accumulo.server.util.adminCommand.ChangeSecret;
+import org.apache.accumulo.server.util.adminCommand.DeleteZooInstance;
+import org.apache.accumulo.server.util.adminCommand.DumpConfig;
+import org.apache.accumulo.server.util.adminCommand.Fate;
+import org.apache.accumulo.server.util.adminCommand.ListInstances;
+import org.apache.accumulo.server.util.adminCommand.ListVolumesUsed;
+import org.apache.accumulo.server.util.adminCommand.Locks;
+import org.apache.accumulo.server.util.adminCommand.PingServer;
+import org.apache.accumulo.server.util.adminCommand.RestoreZookeeper;
+import org.apache.accumulo.server.util.adminCommand.ServiceStatus;
+import org.apache.accumulo.server.util.adminCommand.StopAll;
+import org.apache.accumulo.server.util.adminCommand.StopManager;
+import org.apache.accumulo.server.util.adminCommand.StopServers;
+import org.apache.accumulo.server.util.adminCommand.SystemCheck;
+import org.apache.accumulo.server.util.adminCommand.VerifyTabletAssignments;
+import org.apache.accumulo.shell.Shell;
+import org.apache.accumulo.start.Main;
+import org.apache.accumulo.start.spi.CommandGroup;
+import org.apache.accumulo.start.spi.CommandGroups;
+import org.apache.accumulo.start.spi.KeywordExecutable;
+import org.apache.accumulo.test.RandomWriter;
+import org.apache.accumulo.test.TestBinaryRows;
+import org.apache.accumulo.test.TestIngest;
+import org.apache.accumulo.test.TestMultiTableIngest;
+import org.apache.accumulo.test.TestRandomDeletes;
+import org.apache.accumulo.test.VerifyIngest;
+import org.apache.accumulo.test.cli.TestCommandGroup;
+import org.apache.accumulo.tserver.ScanServer;
+import org.apache.accumulo.tserver.ScanServerExecutable;
+import org.apache.accumulo.tserver.TServerExecutable;
+import org.apache.accumulo.tserver.TabletServer;
+import org.apache.accumulo.tserver.logger.LogReader;
+import org.apache.accumulo.tserver.util.CreateEmpty;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@Tag(SUNNY_DAY)
+public class KeywordStartIT {
+
+  private final Logger log = LoggerFactory.getLogger(getClass());
+
+  /*
+   * Note: Tests below that use this method may be skipped if run in an IDE. That can happen if the
+   * services files haven't been generated by the AutoService annotation processor before this test
+   * runs. The AutoService annotation processor can be forced to run and generate those services
+   * files by running `mvn clean package -DskipTests` before importing the project into your IDE.
+   * There may be other ways to run annotation processors in your IDE, so this may not be necessary,
+   * depending on your IDE and its configuration.
+   */
+  private Map<CommandGroup,Map<String,KeywordExecutable>> getKeywordExecutables() {
+    var all = Main.getExecutables(ClassLoader.getSystemClassLoader());
+    assumeTrue(!all.isEmpty());
+    return all;
+  }
+
+  @Test
+  public void testKeywordsMatch() {
+    getKeywordExecutables().forEach((k, v) -> {
+      v.forEach((k2, v2) -> assertEquals(k2, v2.keyword()));
+    });
+  }
+
+  @Test
+  public void testCheckDuplicates() {
+    NoOp one = new NoOp("one");
+    NoOp anotherOne = new NoOp("another");
+    NoOp two = new NoOp("two");
+    NoOp three = new NoOp("three");
+    List<NoOp> services = Arrays.asList(one, three, two, two, three, three, anotherOne);
+    assertEquals(7, services.size());
+    Map<CommandGroup,Map<String,KeywordExecutable>> results = Main.checkDuplicates(services);
+    assertTrue(results.get(CommandGroups.OTHER).containsKey(one.keyword()));
+    assertTrue(results.get(CommandGroups.OTHER).containsKey(anotherOne.keyword()));
+    assertFalse(results.get(CommandGroups.OTHER).containsKey(two.keyword()));
+    assertFalse(results.get(CommandGroups.OTHER).containsKey(three.keyword()));
+    assertEquals(2, results.get(CommandGroups.OTHER).size());
+  }
+
+  private record CommandInfo(CommandGroup group, String keyword,
+      Class<? extends KeywordExecutable> clazz) implements Comparable<CommandInfo> {
+
+    @Override
+    public int compareTo(CommandInfo o) {
+      int result = this.group.compareTo(o.group);
+      if (result == 0) {
+        result = this.keyword.compareTo(o.keyword);
+        if (result == 0) {
+          result = this.clazz.getName().compareTo(o.clazz.getName());
+        }
+      }
+      return result;
+    }
+  };
+
+  /**
+   * This test guards against accidental renaming or incorrect naming of the keyword used to
+   * identify the service. The keyword is used to access the commands via the command line, so
+   * changes are visible to users and should not be changed.
+   */
+  @Test
+  public void testExpectedClasses() {
+    assumeTrue(Files.exists(Path.of(System.getProperty("user.dir")).resolve("src")));
+    SortedSet<CommandInfo> expectSet = new TreeSet<>();
+    expectSet.add(new CommandInfo(TestCommandGroup.INSTANCE, "binary-rows", TestBinaryRows.class));
+    expectSet.add(new CommandInfo(CommandGroups.COMPACTION, "cancel", CancelCompaction.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "change-secret", ChangeSecret.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "check", SystemCheck.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "check-accumulo-properties",
+        CheckAccumuloProperties.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "check-compaction-config",
+        CheckCompactionConfig.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "compactor", CompactorExecutable.class));
+    expectSet.add(new CommandInfo(CommandGroups.FILE, "create-empty", CreateEmpty.class));
+    expectSet.add(new CommandInfo(CommandGroups.CLIENT, "create-token", CreateToken.class));
+    expectSet
+        .add(new CommandInfo(CommandGroups.INSTANCE, "delete-instance", DeleteZooInstance.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "dump-config", DumpConfig.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "dump-zoo", DumpZookeeper.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "fate", Fate.class));
+    expectSet.add(new CommandInfo(CommandGroups.TABLE, "find-online-ondemand-tablets",
+        ListOnlineOnDemandTablets.class));
+    expectSet.add(
+        new CommandInfo(CommandGroups.TABLE, "find-offline-tablets", FindOfflineTablets.class));
+    expectSet.add(
+        new CommandInfo(CommandGroups.COMPACTION, "find-tmp-files", FindCompactionTmpFiles.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "gc", GCExecutable.class));
+    expectSet.add(new CommandInfo(CommandGroups.FILE, "generate-splits", GenerateSplits.class));
+    expectSet.add(new CommandInfo(CommandGroups.CLIENT, "help", Help.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "info", Info.class));
+    expectSet.add(new CommandInfo(TestCommandGroup.INSTANCE, "ingest", TestIngest.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "init", Initialize.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "list-instances", ListInstances.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "list-compactors", ListCompactors.class));
+    expectSet.add(new CommandInfo(CommandGroups.COMPACTION, "list", ListCompactions.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "list-volumes", ListVolumesUsed.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "locks", Locks.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "login-info", LoginProperties.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "manager", ManagerExecutable.class));
+    expectSet
+        .add(new CommandInfo(CommandGroups.PROCESS, "minicluster", MiniClusterExecutable.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "missing-files",
+        RemoveEntriesForMissingFiles.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "monitor", MonitorExecutable.class));
+    expectSet.add(new CommandInfo(TestCommandGroup.INSTANCE, "multi-table-ingest",
+        TestMultiTableIngest.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "ping", PingServer.class));
+    expectSet
+        .add(new CommandInfo(TestCommandGroup.INSTANCE, "random-deletes", TestRandomDeletes.class));
+    expectSet.add(new CommandInfo(TestCommandGroup.INSTANCE, "random-writer", RandomWriter.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "remove-scan-server-references",
+        ScanServerMetadataEntries.class));
+    expectSet
+        .add(new CommandInfo(CommandGroups.CONFIG, "restore-zookeeper", RestoreZookeeper.class));
+    expectSet.add(new CommandInfo(CommandGroups.FILE, "rfile-info", PrintInfo.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "service-status", ServiceStatus.class));
+    expectSet.add(new CommandInfo(CommandGroups.CLIENT, "shell", Shell.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "create-autocomplete-script",
+        ShellCompletionCommand.class));
+    expectSet.add(new CommandInfo(CommandGroups.FILE, "split-large", SplitLarge.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "sserver", ScanServerExecutable.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "stop-all", StopAll.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "stop-manager", StopManager.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "stop-servers", StopServers.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "tserver", TServerExecutable.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "upgrade", UpgradeUtil.class));
+    expectSet.add(new CommandInfo(TestCommandGroup.INSTANCE, "verify-ingest", VerifyIngest.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "verify-tablet-assignments",
+        VerifyTabletAssignments.class));
+    expectSet.add(new CommandInfo(CommandGroups.CLIENT, "version", Version.class));
+    expectSet.add(new CommandInfo(CommandGroups.FILE, "wal-info", LogReader.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "zoo-info-viewer", ZooInfoViewer.class));
+    expectSet.add(new CommandInfo(CommandGroups.CONFIG, "zoo-prop-editor", ZooPropEditor.class));
+    expectSet.add(new CommandInfo(CommandGroups.PROCESS, "zoo-zap", ZooZap.class));
+    expectSet.add(new CommandInfo(CommandGroups.INSTANCE, "zk-cli", ZooKeeperMain.class));
+
+    Map<CommandGroup,Map<String,KeywordExecutable>> actualExecutables = getKeywordExecutables();
+    SortedSet<CommandInfo> actualSet = new TreeSet<>();
+    actualExecutables.entrySet().forEach((e) -> {
+      e.getValue().entrySet().forEach((e2) -> {
+        actualSet.add(new CommandInfo(e.getKey(), e2.getKey(), e2.getValue().getClass()));
+      });
+    });
+
+    Iterator<CommandInfo> expectIter = expectSet.iterator();
+    Iterator<CommandInfo> actualIter = actualSet.iterator();
+
+    CommandInfo expected;
+    CommandInfo actual;
+    while (expectIter.hasNext() && actualIter.hasNext()) {
+      expected = expectIter.next();
+      actual = actualIter.next();
+      assertEquals(expected.clazz(), actual.clazz(), "Class is not expected");
+      assertEquals(expected.group(), actual.group(),
+          "Usage group for class is not expected: " + expected.clazz());
+      assertEquals(expected.keyword(), actual.keyword(),
+          "Keyword for class is not expected: " + expected.clazz());
+    }
+    boolean moreExpected = expectIter.hasNext();
+    if (moreExpected) {
+      while (expectIter.hasNext()) {
+        log.warn("Missing class for keyword '{}'", expectIter.next());
+      }
+    }
+    assertFalse(moreExpected, "Missing expected classes");
+    boolean moreActual = actualIter.hasNext();
+    if (moreActual) {
+      while (actualIter.hasNext()) {
+        log.warn("Extra class found with keyword '{}'", actualIter.next());
+      }
+    }
+    assertFalse(moreActual, "Found additional unexpected classes");
+  }
+
+  /**
+   * This test validates that legacy tools that had a main method that the main method is not
+   * removed to support user scripts that may use that main method. New utilities should refrain
+   * from adding a main method and instead rely on the ServiceLoader capability.
+   */
+  @Test
+  public void checkHasMain() {
+    assertFalse(hasMain(this.getClass()),
+        "Sanity check for test failed. Somehow the test class has a main method");
+
+    HashSet<Class<?>> expectSet = new HashSet<>();
+    expectSet.add(SystemCheck.class);
+    expectSet.add(Compactor.class);
+    expectSet.add(CreateEmpty.class);
+    expectSet.add(DumpConfig.class);
+    expectSet.add(Initialize.class);
+    expectSet.add(Fate.class);
+    expectSet.add(MiniAccumuloRunner.class);
+    expectSet.add(Monitor.class);
+    expectSet.add(PrintInfo.class);
+    expectSet.add(SetGoalState.class);
+    expectSet.add(Shell.class);
+    expectSet.add(SimpleGarbageCollector.class);
+    expectSet.add(StopAll.class);
+    expectSet.add(StopServers.class);
+    expectSet.add(ScanServer.class);
+    expectSet.add(TabletServer.class);
+
+    // check that classes in the expected set contain a main
+    // not all have them; these do because they always have, and we don't want to break things
+    expectSet.forEach(
+        c -> assertTrue(hasMain(c), "Class " + c.getName() + " is missing a main method!"));
+
+    // build a list of all classed that implement KeywordExecutable
+    Map<CommandGroup,Map<String,KeywordExecutable>> actualExecutables =
+        new TreeMap<>(getKeywordExecutables());
+    Set<Class<? extends KeywordExecutable>> actualSet = new HashSet<>();
+    actualExecutables.entrySet().forEach((e) -> {
+      e.getValue().entrySet().forEach((e2) -> {
+        actualSet.add(e2.getValue().getClass());
+      });
+    });
+
+    // remove the ones we already verified have a main method
+    assertTrue(actualSet.removeAll(expectSet));
+
+    // ensure there's still some left (there should be some that don't have a main method)
+    assertNotEquals(0, actualSet.size());
+
+    // for those remaining, make sure they *don't* have an unexpected main method
+    actualSet.forEach(
+        c -> assertFalse(hasMain(c), "Class " + c.getName() + " has an unexpected main method!"));
+  }
+
+  private static boolean hasMain(Class<?> classToCheck) {
+    Method main;
+    try {
+      main = classToCheck.getMethod("main", String[].class);
+    } catch (NoSuchMethodException e) {
+      return false;
+    }
+    return Modifier.isPublic(main.getModifiers()) && Modifier.isStatic(main.getModifiers());
+  }
+
+  private static class NoOp implements KeywordExecutable {
+
+    private final String kw;
+
+    public NoOp(String kw) {
+      this.kw = kw;
+    }
+
+    @Override
+    public String keyword() {
+      return kw;
+    }
+
+    @Override
+    public String description() {
+      return kw;
+    }
+
+    @Override
+    public void execute(String[] args) {}
+
+  }
+}

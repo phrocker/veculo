@@ -1,0 +1,75 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# This workflow will build a Java project with Maven
+
+name: ScriptQA
+
+on:
+  push:
+    branches: [ '*' ]
+  pull_request:
+    branches: [ '*' ]
+
+permissions:
+  contents: read
+
+jobs:
+  shfmt:
+    name: shfmt
+    timeout-minutes: 3
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Show the first log message
+      run: git log -n1
+    - name: Install shfmt
+      run: src/build/ci/install-shfmt.sh
+    - name: Checking formatting of all scripts
+      run: src/build/ci/run-shfmt.sh
+
+  shellcheck:
+    name: ShellCheck
+    timeout-minutes: 3
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Show the first log message
+      run: git log -n1
+    - name: Install shfmt
+      run: src/build/ci/install-shfmt.sh
+    - name: Running shellcheck on all scripts
+      run: src/build/ci/run-shellcheck.sh
+
+  thrift:
+    name: Thrift
+    timeout-minutes: 3
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Show the first log message
+      run: git log -n1
+    - name: Update package repository
+      run: sudo apt-get update
+    - name: Install xmllint
+      run: sudo apt-get install libxml2-utils
+    - name: Install thrift
+      run: src/build/ci/install-thrift.sh
+    - name: Running thrift to check for changes
+      run: src/build/ci/run-thrift.sh
