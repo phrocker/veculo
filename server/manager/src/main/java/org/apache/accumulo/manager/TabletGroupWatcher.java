@@ -244,6 +244,7 @@ abstract class TabletGroupWatcher extends AccumuloDaemonThread {
     private final List<TabletMetadata> suspendedToGoneServers = new ArrayList<>();
     private final Map<KeyExtent,UnassignedTablet> unassigned = new HashMap<>();
     private final Map<TServerInstance,List<Path>> logsForDeadServers = new TreeMap<>();
+    private final Map<String,java.util.List<String>> walPeersMap = new HashMap<>();
     // read only list of tablet servers that are not shutting down
     private final SortedMap<TServerInstance,TabletServerStatus> destinations;
     private final Map<ResourceGroupId,Set<TServerInstance>> currentTServerGrouping;
@@ -956,7 +957,16 @@ abstract class TabletGroupWatcher extends AccumuloDaemonThread {
     tLists.assignedToDeadServers.add(tm);
     TServerInstance tserver = tm.getLocation().getServerInstance();
     if (!tLists.logsForDeadServers.containsKey(tserver)) {
-      tLists.logsForDeadServers.put(tserver, walStateManager.getWalsInUse(tserver));
+      // Use peer-aware WAL lookup so we can pass peers through to the metadata table.
+      var walsWithPeers = walStateManager.getWalsInUseWithPeers(tserver);
+      var paths = new java.util.ArrayList<Path>();
+      for (var wal : walsWithPeers) {
+        paths.add(wal.path);
+        if (!wal.peers.isEmpty()) {
+          tLists.walPeersMap.put(wal.path.getName(), wal.peers);
+        }
+      }
+      tLists.logsForDeadServers.put(tserver, paths);
     }
   }
 
@@ -1034,6 +1044,13 @@ abstract class TabletGroupWatcher extends AccumuloDaemonThread {
             store.name(), server, logs));
       } else {
         Manager.log.debug("[{}] {} logs exist for dead servers", store.name(), deadLogs.size());
+      }
+      // Pass WAL peer addresses to the state store so log entries written to metadata
+      // include peers for qwal:// recovery.
+      if (!tLists.walPeersMap.isEmpty()
+          && store instanceof org.apache.accumulo.server.manager.state.AbstractTabletStateStore) {
+        ((org.apache.accumulo.server.manager.state.AbstractTabletStateStore) store)
+            .setWalPeersMap(tLists.walPeersMap);
       }
       if (canSuspendTablets()) {
         store.suspend(deadTablets, deadLogs, manager.getSteadyTime());

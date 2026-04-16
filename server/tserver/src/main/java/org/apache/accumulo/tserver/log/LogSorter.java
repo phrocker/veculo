@@ -102,7 +102,7 @@ public class LogSorter implements MetricsProducer {
       String src = parts[0];
       String dest = parts[1];
       String sortId = new Path(src).getName();
-      log.debug("Sorting {} to {} using sortId {}", src, dest, sortId);
+      log.info("WAL sort work received: src={}, dest={}, sortId={}", src, dest, sortId);
 
       synchronized (currentWork) {
         if (currentWork.containsKey(sortId)) {

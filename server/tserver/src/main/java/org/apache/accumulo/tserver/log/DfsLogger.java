@@ -66,12 +66,14 @@ import org.apache.accumulo.core.util.threads.Threads;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.fs.VolumeChooserEnvironmentImpl;
 import org.apache.accumulo.server.fs.VolumeManager;
+import org.apache.accumulo.server.fs.WalPeerProvider;
 import org.apache.accumulo.tserver.TabletMutations;
 import org.apache.accumulo.tserver.logger.LogFileKey;
 import org.apache.accumulo.tserver.logger.LogFileValue;
 import org.apache.accumulo.tserver.tablet.CommitSession;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.DFSOutputStream;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
@@ -322,11 +324,33 @@ public final class DfsLogger implements Comparable<DfsLogger> {
         context.getVolumeManager().choose(chooserEnv, context.getBaseUris()) + Path.SEPARATOR
             + Constants.WAL_DIR + Path.SEPARATOR + addressForFilename + Path.SEPARATOR + filename;
 
-    LogEntry log = LogEntry.fromPath(logPath);
-    DfsLogger dfsLogger = new DfsLogger(log);
+    LogEntry logEntry = LogEntry.fromPath(logPath);
+    DfsLogger dfsLogger = new DfsLogger(logEntry);
     long slowFlushMillis =
         context.getConfiguration().getTimeInMillis(Property.TSERV_SLOW_FLUSH_MILLIS);
     dfsLogger.open(context, logPath, filename, address, syncCounter, flushCounter, slowFlushMillis);
+
+    // For qwal:// WALs, extract peer addresses from the FileSystem so they can be
+    // stored in the metadata table for recovery. The sidecar reports which peers
+    // hold replicas when the segment is opened.
+    if (logPath.startsWith("qwal://")) {
+      try {
+        FileSystem rawFs = context.getVolumeManager().getFileSystemByPath(new Path(logPath));
+        log.info("WAL peer check: path={}, fs class={}, isWalPeerProvider={}", logPath,
+            rawFs.getClass().getName(), (rawFs instanceof WalPeerProvider));
+        if (rawFs instanceof WalPeerProvider) {
+          List<String> peers = ((WalPeerProvider) rawFs).getSegmentPeers(filename);
+          log.info("WAL peer lookup: uuid={}, peers={}", filename, peers);
+          if (!peers.isEmpty()) {
+            logEntry.setPeers(peers);
+            log.info("WAL {} has quorum peers: {}", filename, peers);
+          }
+        }
+      } catch (Exception e) {
+        log.warn("Failed to get WAL peers for {}: {}", logPath, e.getMessage(), e);
+      }
+    }
+
     return dfsLogger;
   }
 
@@ -545,6 +569,31 @@ public final class DfsLogger implements Comparable<DfsLogger> {
   public synchronized long getWrites() {
     Preconditions.checkState(writes >= 0);
     return writes;
+  }
+
+  /**
+   * Returns true if the underlying WAL stream reports degraded quorum replication. This indicates
+   * that fewer peers than expected acknowledged writes, and the WAL should be closed early so the
+   * sidecar can seal and upload it to GCS for full durability.
+   *
+   * <p>
+   * Always returns false for non-qwal WALs.
+   */
+  public boolean isDegraded() {
+    if (logFile == null) {
+      return false;
+    }
+    try {
+      java.io.OutputStream wrapped = logFile.getWrappedStream();
+      // QuorumWalOutputStream may be wrapped — check via reflection to avoid
+      // a compile-time dependency on server/pvc-fs from server/tserver.
+      java.lang.reflect.Method m = wrapped.getClass().getMethod("isDegraded");
+      return (Boolean) m.invoke(wrapped);
+    } catch (NoSuchMethodException e) {
+      return false; // not a QuorumWalOutputStream
+    } catch (Exception e) {
+      return false;
+    }
   }
 
   public LoggerOperation defineTablet(CommitSession cs) throws IOException {

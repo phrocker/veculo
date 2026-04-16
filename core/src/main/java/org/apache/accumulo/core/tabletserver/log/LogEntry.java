@@ -18,6 +18,8 @@
  */
 package org.apache.accumulo.core.tabletserver.log;
 
+import java.util.Collections;
+import java.util.List;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.UUID;
@@ -39,6 +41,13 @@ public final class LogEntry {
   private final HostAndPort tserver;
   private final UUID uniqueId;
   private final Text columnQualifier;
+
+  /**
+   * Peer sidecar addresses that hold replicas of this WAL segment. Used during recovery to contact
+   * specific peers instead of scanning all peers via DNS pattern. Stored in the metadata table
+   * Value as a comma-separated string.
+   */
+  private List<String> peers = Collections.emptyList();
 
   private LogEntry(String path, HostAndPort tserver, UUID uniqueId, Text columnQualifier) {
     this.path = path;
@@ -115,7 +124,15 @@ public final class LogEntry {
     Text qualifier = entry.getKey().getColumnQualifier();
     String[] parts = qualifier.toString().split("/", 2);
     Preconditions.checkArgument(parts.length == 2, "Malformed write-ahead log %s", qualifier);
-    return validatedLogEntry(parts[1], qualifier);
+    LogEntry logEntry = validatedLogEntry(parts[1], qualifier);
+
+    // Read peer addresses from Value if present (stored by qwal:// WAL entries).
+    Value value = entry.getValue();
+    if (value != null && value.getSize() > 0) {
+      logEntry.peers = List.of(value.toString().split(","));
+    }
+
+    return logEntry;
   }
 
   @NonNull
@@ -132,6 +149,23 @@ public final class LogEntry {
   @NonNull
   public UUID getUniqueID() {
     return uniqueId;
+  }
+
+  /**
+   * Returns the peer sidecar addresses that hold replicas of this WAL segment. Empty if no peers
+   * are recorded (non-qwal WALs or legacy entries).
+   */
+  @NonNull
+  public List<String> getPeers() {
+    return peers;
+  }
+
+  /**
+   * Sets the peer sidecar addresses for this WAL segment. Called by the tserver after the sidecar
+   * reports which peers received replicas.
+   */
+  public void setPeers(List<String> peers) {
+    this.peers = peers == null ? Collections.emptyList() : List.copyOf(peers);
   }
 
   @Override
@@ -181,7 +215,9 @@ public final class LogEntry {
    * @param mutation the mutation to update
    */
   public void addToMutation(Mutation mutation) {
-    mutation.put(LogColumnFamily.NAME, newCQ(), new Value());
+    Value value =
+        (peers != null && !peers.isEmpty()) ? new Value(String.join(",", peers)) : new Value();
+    mutation.put(LogColumnFamily.NAME, newCQ(), value);
   }
 
 }

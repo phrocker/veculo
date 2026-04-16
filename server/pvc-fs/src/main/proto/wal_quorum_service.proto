@@ -1,0 +1,250 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+syntax = "proto3";
+
+package org.apache.accumulo.server.fs.pvc.wal;
+
+option go_package = "github.com/accumulo/wal-quorum-sidecar/proto/qwalpb";
+option java_package = "org.apache.accumulo.server.fs.pvc.proto";
+option java_outer_classname = "WalQuorumServiceProto";
+option java_multiple_files = true;
+
+// ---------------------------------------------------------------------------
+// WalQuorumLocal — TServer <-> sidecar communication over Unix domain socket.
+// ---------------------------------------------------------------------------
+service WalQuorumLocal {
+  // Open a new WAL segment for writing.
+  rpc OpenSegment(OpenSegmentRequest) returns (OpenSegmentResponse);
+
+  // Bidirectional stream: TServer streams WAL bytes, sidecar streams acks
+  // after quorum write has been confirmed.
+  rpc WriteEntries(stream WriteEntryRequest) returns (stream WriteEntryResponse);
+
+  // Block until a quorum of replicas have called fdatasync for the segment.
+  rpc SyncSegment(SyncSegmentRequest) returns (SyncSegmentResponse);
+
+  // Seal the segment (no more writes) and trigger async GCS upload.
+  rpc CloseSegment(CloseSegmentRequest) returns (CloseSegmentResponse);
+
+  // Health probe for readiness/liveness checks.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ---------------------------------------------------------------------------
+// WalQuorumPeer — sidecar <-> sidecar communication over TCP port 9710.
+// ---------------------------------------------------------------------------
+service WalQuorumPeer {
+  // Prepare a replica segment on this peer (creates file, reserves space).
+  rpc PrepareSegment(PrepareSegmentRequest) returns (PrepareSegmentResponse);
+
+  // Bidirectional replication stream: originator sends entries, peer acks.
+  rpc ReplicateEntries(stream ReplicateEntryRequest) returns (stream ReplicateEntryResponse);
+
+  // Seal a replica segment; peer verifies final checksum matches.
+  rpc SealSegment(SealSegmentRequest) returns (SealSegmentResponse);
+
+  // Stream a segment back to the caller (used during recovery reads).
+  rpc ReadSegment(ReadSegmentRequest) returns (stream SegmentChunk);
+
+  // List all segments held on this peer.
+  rpc ListSegments(ListSegmentsRequest) returns (ListSegmentsResponse);
+
+  // Delete a segment that has been durably uploaded to GCS.
+  rpc PurgeSegment(PurgeSegmentRequest) returns (PurgeSegmentResponse);
+}
+
+// ===========================================================================
+// Common types
+// ===========================================================================
+
+// Unique identity for a WAL segment.
+message SegmentId {
+  // UUID assigned by the originator when the segment is opened.
+  string uuid = 1;
+  // WAL path within the Accumulo namespace (e.g. /accumulo/wal/<addr>/<uuid>).
+  string wal_path = 2;
+}
+
+// ===========================================================================
+// WalQuorumLocal messages
+// ===========================================================================
+
+message OpenSegmentRequest {
+  SegmentId segment_id = 1;
+  // Pod name of the TServer that owns this WAL.
+  string originator_pod = 2;
+  // Desired replication factor (typically 3).
+  uint32 replication_factor = 3;
+}
+
+message OpenSegmentResponse {
+  bool success = 1;
+  string error = 2;
+  // Peers that acknowledged the PrepareSegment call.
+  repeated string prepared_peers = 3;
+}
+
+message WriteEntryRequest {
+  SegmentId segment_id = 1;
+  // Monotonically increasing sequence number within the segment.
+  uint64 sequence_num = 2;
+  // Raw WAL entry bytes.
+  bytes data = 3;
+  // CRC-32C checksum of data.
+  uint32 checksum = 4;
+}
+
+message WriteEntryResponse {
+  SegmentId segment_id = 1;
+  // Sequence number being acknowledged.
+  uint64 acked_sequence_num = 2;
+  // Number of replicas (including local) that persisted this entry.
+  uint32 quorum_count = 3;
+  // Current write offset in the segment after this entry.
+  int64 committed_offset = 4;
+}
+
+message SyncSegmentRequest {
+  SegmentId segment_id = 1;
+}
+
+message SyncSegmentResponse {
+  bool success = 1;
+  string error = 2;
+  // Durable offset after sync across the quorum.
+  int64 synced_offset = 3;
+}
+
+message CloseSegmentRequest {
+  SegmentId segment_id = 1;
+  // SHA-256 digest of the full segment computed by the TServer.
+  bytes final_checksum = 2;
+}
+
+message CloseSegmentResponse {
+  bool success = 1;
+  string error = 2;
+  // Total bytes in the sealed segment.
+  int64 segment_size = 3;
+  // GCS object name where the segment will be uploaded.
+  string gcs_object_path = 4;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  enum Status {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+  }
+  Status status = 1;
+  uint32 open_segments = 2;
+  uint32 peer_connections = 3;
+}
+
+// ===========================================================================
+// WalQuorumPeer messages
+// ===========================================================================
+
+message PrepareSegmentRequest {
+  SegmentId segment_id = 1;
+  string originator_pod = 2;
+  // Expected maximum size hint for pre-allocation (bytes).
+  int64 expected_size = 3;
+}
+
+message PrepareSegmentResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ReplicateEntryRequest {
+  SegmentId segment_id = 1;
+  uint64 sequence_num = 2;
+  bytes data = 3;
+  uint32 checksum = 4;
+  // Byte offset within the segment where this entry starts.
+  int64 offset = 5;
+}
+
+message ReplicateEntryResponse {
+  SegmentId segment_id = 1;
+  uint64 acked_sequence_num = 2;
+  // Byte offset after writing this entry on the replica.
+  int64 persisted_offset = 3;
+}
+
+message SealSegmentRequest {
+  SegmentId segment_id = 1;
+  // SHA-256 digest the originator computed; peer must match.
+  bytes expected_checksum = 2;
+  int64 expected_size = 3;
+}
+
+message SealSegmentResponse {
+  bool success = 1;
+  string error = 2;
+  // Actual checksum computed by the peer.
+  bytes actual_checksum = 3;
+  int64 actual_size = 4;
+}
+
+message ReadSegmentRequest {
+  SegmentId segment_id = 1;
+  // Start reading from this offset (0 = beginning).
+  int64 offset = 2;
+  // Maximum bytes to read (0 = read to end).
+  int64 max_bytes = 3;
+}
+
+message SegmentChunk {
+  bytes data = 1;
+  int64 offset = 2;
+  bool last = 3;
+}
+
+message ListSegmentsRequest {
+  // Optional filter: only return segments for this originator.
+  string originator_pod = 1;
+}
+
+message ListSegmentsResponse {
+  repeated SegmentInfo segments = 1;
+}
+
+message SegmentInfo {
+  SegmentId segment_id = 1;
+  string originator_pod = 2;
+  int64 size = 3;
+  bool sealed = 4;
+  // Milliseconds since epoch.
+  int64 created_at = 5;
+  int64 sealed_at = 6;
+}
+
+message PurgeSegmentRequest {
+  SegmentId segment_id = 1;
+}
+
+message PurgeSegmentResponse {
+  bool success = 1;
+  string error = 2;
+}

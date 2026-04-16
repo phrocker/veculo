@@ -121,12 +121,22 @@ public class WalStateManager {
 
   // Tablet server opens a new WAL
   public void addNewWalMarker(TServerInstance tsi, Path path) throws WalMarkerException {
-    updateState(tsi, path, WalState.OPEN);
+    updateState(tsi, path, WalState.OPEN, null);
   }
 
-  private void updateState(TServerInstance tsi, Path path, WalState state)
+  // Tablet server opens a new WAL with peer addresses for quorum replication
+  public void addNewWalMarker(TServerInstance tsi, Path path, java.util.List<String> peers)
       throws WalMarkerException {
-    byte[] data = (state + "," + path).getBytes(UTF_8);
+    updateState(tsi, path, WalState.OPEN, peers);
+  }
+
+  private void updateState(TServerInstance tsi, Path path, WalState state,
+      java.util.List<String> peers) throws WalMarkerException {
+    String dataStr = state + "," + path;
+    if (peers != null && !peers.isEmpty()) {
+      dataStr += "|" + String.join(",", peers);
+    }
+    byte[] data = dataStr.getBytes(UTF_8);
     try {
       NodeExistsPolicy policy = NodeExistsPolicy.OVERWRITE;
       if (state == WalState.OPEN) {
@@ -141,26 +151,60 @@ public class WalStateManager {
 
   // Tablet server has no references to the WAL
   public void walUnreferenced(TServerInstance tsi, Path path) throws WalMarkerException {
-    updateState(tsi, path, WalState.UNREFERENCED);
+    updateState(tsi, path, WalState.UNREFERENCED, null);
+  }
+
+  /**
+   * Parsed WAL marker from ZooKeeper. Contains the state, path, and optional peer addresses.
+   */
+  public static class WalMarkerData {
+    public final WalState state;
+    public final Path path;
+    public final java.util.List<String> peers;
+
+    WalMarkerData(WalState state, Path path, java.util.List<String> peers) {
+      this.state = state;
+      this.path = path;
+      this.peers = peers;
+    }
   }
 
   public static Pair<WalState,Path> parse(byte[] data) {
-    String[] parts = new String(data, UTF_8).split(",");
-    return new Pair<>(WalState.valueOf(parts[0]), new Path(parts[1]));
+    WalMarkerData parsed = parseWithPeers(data);
+    return new Pair<>(parsed.state, parsed.path);
+  }
+
+  public static WalMarkerData parseWithPeers(byte[] data) {
+    String str = new String(data, UTF_8);
+    // Format: "STATE,path" or "STATE,path|peer1:port,peer2:port"
+    java.util.List<String> peers = java.util.Collections.emptyList();
+    int pipeIdx = str.indexOf('|');
+    if (pipeIdx >= 0) {
+      String peerStr = str.substring(pipeIdx + 1);
+      if (!peerStr.isEmpty()) {
+        peers = java.util.List.of(peerStr.split(","));
+      }
+      str = str.substring(0, pipeIdx);
+    }
+    String[] parts = str.split(",", 2);
+    return new WalMarkerData(WalState.valueOf(parts[0]), new Path(parts[1]), peers);
   }
 
   // Manager needs to know the logs for the given instance
   public List<Path> getWalsInUse(TServerInstance tsi) throws WalMarkerException {
-    List<Path> result = new ArrayList<>();
+    return getWalsInUseWithPeers(tsi).stream().map(wmd -> wmd.path)
+        .collect(java.util.stream.Collectors.toList());
+  }
+
+  // Manager needs to know the logs and their peers for the given instance
+  public List<WalMarkerData> getWalsInUseWithPeers(TServerInstance tsi) throws WalMarkerException {
+    List<WalMarkerData> result = new ArrayList<>();
     try {
       String zpath = root() + "/" + tsi;
       zoo.sync(zpath);
       for (String child : zoo.getChildren(zpath)) {
         byte[] zdata = null;
         try {
-          // This function is called by the Manager. Its possible that Accumulo GC deletes an
-          // unreferenced WAL in ZK after the call to getChildren above. Catch this exception inside
-          // the loop so that not all children are ignored.
           zdata = zoo.getData(zpath + "/" + child);
         } catch (KeeperException.NoNodeException e) {
           log.debug("WAL state removed {} {} during getWalsInUse.  Likely a race condition between "
@@ -168,9 +212,9 @@ public class WalStateManager {
         }
 
         if (zdata != null) {
-          Pair<WalState,Path> parts = parse(zdata);
-          if (parts.getFirst() != WalState.UNREFERENCED) {
-            result.add(parts.getSecond());
+          WalMarkerData parsed = parseWithPeers(zdata);
+          if (parsed.state != WalState.UNREFERENCED) {
+            result.add(parsed);
           }
         }
       }
@@ -252,6 +296,12 @@ public class WalStateManager {
   // manager can mark a log as unreferenced after it has made log recovery markers on the tablets
   // that need to be recovered
   public void closeWal(TServerInstance instance, Path path) throws WalMarkerException {
-    updateState(instance, path, WalState.CLOSED);
+    closeWal(instance, path, null);
+  }
+
+  // Close WAL while preserving peer addresses for quorum WAL recovery
+  public void closeWal(TServerInstance instance, Path path, java.util.List<String> peers)
+      throws WalMarkerException {
+    updateState(instance, path, WalState.CLOSED, peers);
   }
 }

@@ -81,7 +81,13 @@ public class VolumeUtil {
 
   public static LogEntry switchVolume(LogEntry le, Map<Path,Path> replacements) {
     Path switchedPath = switchVolume(new Path(le.getPath()), FileType.WAL, replacements);
-    return switchedPath == null ? null : LogEntry.fromPath(switchedPath.toString());
+    if (switchedPath == null) {
+      return null;
+    }
+    LogEntry switched = LogEntry.fromPath(switchedPath.toString());
+    // Preserve peer addresses from the original entry for quorum WAL recovery
+    switched.setPeers(le.getPeers());
+    return switched;
   }
 
   public static boolean needsVolumeReplacement(final Map<Path,Path> replacements,

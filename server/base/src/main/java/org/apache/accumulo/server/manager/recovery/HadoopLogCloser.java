@@ -23,6 +23,7 @@ import java.io.IOException;
 
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.conf.Property;
+import org.apache.accumulo.core.tabletserver.log.LogEntry;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
@@ -40,7 +41,8 @@ public class HadoopLogCloser implements LogCloser {
 
   @Override
   public long close(AccumuloConfiguration conf, Configuration hadoopConf, VolumeManager fs,
-      Path source) throws IOException {
+      LogEntry logEntry) throws IOException {
+    Path source = new Path(logEntry.getPath());
     FileSystem ns = fs.getFileSystemByPath(source);
 
     // if path points to a viewfs path, then resolve to underlying filesystem

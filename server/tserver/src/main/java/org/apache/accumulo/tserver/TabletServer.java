@@ -121,6 +121,7 @@ import org.apache.accumulo.server.compaction.PausedCompactionMetrics;
 import org.apache.accumulo.server.conf.TableConfiguration;
 import org.apache.accumulo.server.fs.VolumeChooserEnvironmentImpl;
 import org.apache.accumulo.server.fs.VolumeManager;
+// WalRecoveryServer is optional — only available when accumulo-pvc-fs JAR is on classpath
 import org.apache.accumulo.server.log.WalStateManager;
 import org.apache.accumulo.server.log.WalStateManager.WalMarkerException;
 import org.apache.accumulo.server.rpc.TServerUtils;
@@ -211,6 +212,7 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   private final ZooAuthenticationKeyWatcher authKeyWatcher;
   private final WalStateManager walMarker;
   private final ServerContext context;
+  private volatile AutoCloseable pvcFileServer;
 
   public static void main(String[] args) throws Exception {
     AbstractServer.startServer(new TabletServer(new ServerOpts(), ServerContext::new, args), log);
@@ -546,6 +548,23 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
       throw new RuntimeException("Failed to start the tablet client service", e1);
     }
 
+    // Start WAL recovery server for cross-pod WAL reads (Kubernetes tiered storage).
+    // Uses reflection so the tserver works without the pvc-fs JAR on the classpath.
+    try {
+      Class<?> walClass = Class.forName("org.apache.accumulo.server.fs.pvc.WalRecoveryServer");
+      int pvcPort = Integer.parseInt(context.getHadoopConf().get("fs.pvc.grpc.port", "9701"));
+      String pvcRoot = context.getHadoopConf().get("fs.pvc.local.root", "/mnt/data");
+      Object server =
+          walClass.getConstructor(String.class, int.class).newInstance(pvcRoot, pvcPort);
+      walClass.getMethod("start").invoke(server);
+      pvcFileServer = (AutoCloseable) server;
+      log.info("WAL recovery server started on port {}", pvcPort);
+    } catch (ClassNotFoundException e) {
+      log.debug("WAL recovery server not available (accumulo-pvc-fs JAR not on classpath)");
+    } catch (Exception e) {
+      log.warn("Failed to start WAL recovery server: {}", e.getMessage());
+    }
+
     MetricsInfo metricsInfo = context.getMetricsInfo();
 
     metrics = new TabletServerMetrics(this);
@@ -693,6 +712,16 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
       Halt.halt(1, "Error informing Manager that we are shutting down, exiting!", e);
     } finally {
       returnManagerConnection(iface);
+    }
+
+    // Stop WAL recovery server
+    if (pvcFileServer != null) {
+      try {
+        pvcFileServer.close();
+        log.info("WAL recovery server stopped");
+      } catch (Exception e) {
+        log.warn("Error stopping WAL recovery server: {}", e.getMessage());
+      }
     }
 
     log.debug("Stopping Thrift Servers");
@@ -1029,8 +1058,9 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
   }
 
   public void addNewLogMarker(DfsLogger copy) throws WalMarkerException {
-    log.info("Writing log marker for " + copy.getPath());
-    walMarker.addNewWalMarker(getTabletSession(), copy.getPath());
+    var peers = copy.getLogEntry().getPeers();
+    log.info("Writing log marker for {} peers={}", copy.getPath(), peers);
+    walMarker.addNewWalMarker(getTabletSession(), copy.getPath(), peers);
   }
 
   public void walogClosed(DfsLogger currentLog) throws WalMarkerException {
@@ -1042,7 +1072,8 @@ public class TabletServer extends AbstractServer implements TabletHostingServer 
         clSize = closedLogs.size();
       }
       log.info("Marking " + currentLog.getPath() + " as closed. Total closed logs " + clSize);
-      walMarker.closeWal(getTabletSession(), currentLog.getPath());
+      walMarker.closeWal(getTabletSession(), currentLog.getPath(),
+          currentLog.getLogEntry().getPeers());
 
       // whenever a new log is added to the set of closed logs, go through all of the tablets and
       // see if any need to minor compact

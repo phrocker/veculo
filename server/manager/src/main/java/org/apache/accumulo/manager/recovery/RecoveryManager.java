@@ -84,14 +84,14 @@ public class RecoveryManager {
   }
 
   private class LogSortTask implements Runnable {
-    private final String source;
+    private final LogEntry walog;
     private final String destination;
     private final String sortId;
     private final LogCloser closer;
 
-    public LogSortTask(LogCloser closer, String source, String destination, String sortId) {
+    public LogSortTask(LogCloser closer, LogEntry walog, String destination, String sortId) {
       this.closer = closer;
-      this.source = source;
+      this.walog = walog;
       this.destination = destination;
       this.sortId = sortId;
     }
@@ -101,19 +101,19 @@ public class RecoveryManager {
       boolean rescheduled = false;
       try {
         long time = closer.close(manager.getConfiguration(), manager.getContext().getHadoopConf(),
-            manager.getVolumeManager(), new Path(source));
+            manager.getVolumeManager(), walog);
 
         if (time > 0) {
           ScheduledFuture<?> future = executor.schedule(this, time, TimeUnit.MILLISECONDS);
           ThreadPools.watchNonCriticalScheduledTask(future);
           rescheduled = true;
         } else {
-          initiateSort(sortId, source, destination);
+          initiateSort(sortId, walog.getPath(), destination);
         }
       } catch (FileNotFoundException e) {
-        log.debug("Unable to initiate log sort for " + source + ": " + e);
+        log.debug("Unable to initiate log sort for " + walog.getPath() + ": " + e);
       } catch (Exception e) {
-        log.warn("Failed to initiate log sort " + source, e);
+        log.warn("Failed to initiate log sort " + walog.getPath(), e);
       } finally {
         if (!rescheduled) {
           synchronized (RecoveryManager.this) {
@@ -230,10 +230,11 @@ public class RecoveryManager {
           delay = Math.min(2 * delay, 1000 * 60 * 5L);
         }
 
-        log.info("Starting recovery of {} (in : {}s)", filename, (delay / 1000));
+        log.info("Starting recovery of {} (in : {}s), peers={}", filename, (delay / 1000),
+            walog.getPeers());
 
-        ScheduledFuture<?> future = executor.schedule(
-            new LogSortTask(closer, filename, dest, sortId), delay, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> future = executor.schedule(new LogSortTask(closer, walog, dest, sortId),
+            delay, TimeUnit.MILLISECONDS);
         ThreadPools.watchNonCriticalScheduledTask(future);
         closeTasksQueued.add(sortId);
         recoveryDelay.put(sortId, delay);

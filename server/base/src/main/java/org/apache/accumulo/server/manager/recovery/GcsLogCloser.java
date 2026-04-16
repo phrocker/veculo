@@ -21,9 +21,9 @@ package org.apache.accumulo.server.manager.recovery;
 import java.io.IOException;
 
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
+import org.apache.accumulo.core.tabletserver.log.LogEntry;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,10 +46,11 @@ public class GcsLogCloser implements LogCloser {
 
   @Override
   public long close(AccumuloConfiguration conf, Configuration hadoopConf, VolumeManager fs,
-      Path path) throws IOException {
+      LogEntry logEntry) throws IOException {
     // GCS files are immutable — no lease recovery needed.
     // Return 0 to indicate the file is ready for sort/recovery.
-    log.debug("GcsLogCloser: skipping lease recovery for {} (object store, no leases)", path);
+    log.debug("GcsLogCloser: skipping lease recovery for {} (object store, no leases)",
+        logEntry.getPath());
     return 0;
   }
 }

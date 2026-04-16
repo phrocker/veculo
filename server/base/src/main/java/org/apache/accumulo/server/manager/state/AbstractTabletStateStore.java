@@ -48,8 +48,23 @@ public abstract class AbstractTabletStateStore implements TabletStateStore {
 
   private final Ample ample;
 
+  /**
+   * Optional map of WAL segment UUID → peer addresses. Set by the manager when it reads WAL markers
+   * from ZooKeeper. Used to populate LogEntry peers when writing log entries to metadata for dead
+   * servers.
+   */
+  private volatile Map<String,List<String>> walPeersMap;
+
   protected AbstractTabletStateStore(ServerContext context) {
     this.ample = context.getAmple();
+  }
+
+  /**
+   * Sets the WAL peer map (segment UUID → peer addresses) so that log entries written to metadata
+   * for dead servers include the peer addresses needed for recovery.
+   */
+  public void setWalPeersMap(Map<String,List<String>> walPeersMap) {
+    this.walPeersMap = walPeersMap;
   }
 
   @Override
@@ -149,6 +164,13 @@ public abstract class AbstractTabletStateStore implements TabletStateStore {
             if (logs != null) {
               for (Path log : logs) {
                 LogEntry entry = LogEntry.fromPath(log.toString());
+                // Look up peers from the walPeersMap if available.
+                if (walPeersMap != null) {
+                  var peers = walPeersMap.get(log.getName());
+                  if (peers != null && !peers.isEmpty()) {
+                    entry.setPeers(peers);
+                  }
+                }
                 tabletMutator.putWal(entry);
               }
             }
